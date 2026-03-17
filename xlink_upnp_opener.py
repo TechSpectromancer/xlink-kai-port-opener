@@ -908,6 +908,197 @@ def check_vpn_active():
         return None, f"VPN check failed: {e}"
 
 
+def check_port_conflict():
+    """Check if UDP 3074 or 30000 are bound by a process other than Xlink Kai."""
+    try:
+        # Get PIDs belonging to Xlink Kai so we can exclude them
+        kai_pids = set()
+        for exe in ["kaiEngine.exe", "XLinkKai.exe"]:
+            try:
+                tl = subprocess.check_output(
+                    ["tasklist", "/FI", f"IMAGENAME eq {exe}", "/NH", "/FO", "CSV"],
+                    stderr=subprocess.DEVNULL, creationflags=NO_WIN
+                ).decode(errors="ignore")
+                for line in tl.splitlines():
+                    parts = line.strip().strip('"').split('","')
+                    if len(parts) >= 2:
+                        try:
+                            kai_pids.add(int(parts[1]))
+                        except ValueError:
+                            pass
+            except Exception:
+                pass
+
+        # netstat -ano shows UDP lines with PIDs: "UDP  0.0.0.0:3074  *:*  12345"
+        out = subprocess.check_output(
+            ["netstat", "-ano"],
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore")
+
+        conflicts = []
+        for port, _, _ in PORTS:
+            for line in out.splitlines():
+                m = re.match(r'\s*UDP\s+\S+:' + str(port) + r'\s+\S+\s+(\d+)', line)
+                if m:
+                    pid = int(m.group(1))
+                    if pid not in kai_pids:
+                        conflicts.append(f"UDP {port} (PID {pid})")
+
+        if conflicts:
+            return None, (f"Port(s) in use by another app: {', '.join(conflicts)} — "
+                          f"see Auto-Fix log for how to identify and close it")
+        return True, "UDP 3074 & 30000 are free — no port conflicts detected"
+    except Exception as e:
+        return None, f"Port conflict check failed: {e}"
+
+
+def check_upnp_conflicts(ctrl, stype):
+    """Check if router already has 3074/30000 mapped to a different device."""
+    if not ctrl or not stype:
+        return None, "Router not detected — run Re-detect Router first"
+    local_ip = get_local_ip()
+    conflicts = []
+    try:
+        for port, proto, _ in PORTS:
+            args = (f"<NewRemoteHost></NewRemoteHost>"
+                    f"<NewExternalPort>{port}</NewExternalPort>"
+                    f"<NewProtocol>{proto}</NewProtocol>")
+            resp, status = soap_action(ctrl, stype, "GetSpecificPortMappingEntry", args)
+            if status == 200:
+                m = re.search(r"<NewInternalClient>(.*?)</NewInternalClient>", resp)
+                if m:
+                    mapped_ip = m.group(1).strip()
+                    if mapped_ip and mapped_ip != local_ip:
+                        conflicts.append(f"UDP {port} → {mapped_ip}")
+        if conflicts:
+            return False, (f"Router ports mapped to another device: {'; '.join(conflicts)} — "
+                           f"remove those mappings or open ports from that device instead")
+        return True, "No conflicting UPnP mappings on router"
+    except Exception as e:
+        return None, f"UPnP conflict check failed: {e}"
+
+
+_MTU_SKIP = ("loopback", "pseudo", "isatap", "teredo", "6to4",
+             "local area connection*", "virtual")
+
+def _mtu_is_real_adapter(name):
+    """Return True if this adapter name should be included in MTU checks."""
+    n = name.lower()
+    return not any(skip in n for skip in _MTU_SKIP)
+
+
+def check_mtu():
+    """Check if any physical/Wi-Fi adapter has an MTU above 1500."""
+    try:
+        out = subprocess.check_output(
+            ["netsh", "interface", "ipv4", "show", "subinterfaces"],
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore")
+        high_mtu = []
+        for line in out.splitlines():
+            m = re.match(r'^\s*(\d+)\s+\d+\s+\d+\s+\d+\s+(.+)$', line)
+            if m:
+                mtu, name = int(m.group(1)), m.group(2).strip()
+                if mtu > 1500 and _mtu_is_real_adapter(name):
+                    high_mtu.append(f"{name} (MTU {mtu})")
+        if high_mtu:
+            return False, (f"High MTU on: {', '.join(high_mtu)} — "
+                           f"values above 1500 cause fragmentation; Auto-Fix can correct this")
+        return True, "MTU is 1500 or below on all adapters — OK"
+    except Exception as e:
+        return None, f"MTU check failed: {e}"
+
+
+def fix_mtu():
+    """Set MTU to 1500 on any real adapter currently above 1500."""
+    try:
+        out = subprocess.check_output(
+            ["netsh", "interface", "ipv4", "show", "subinterfaces"],
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore")
+        fixed = []
+        failed = []
+        for line in out.splitlines():
+            m = re.match(r'^\s*(\d+)\s+\d+\s+\d+\s+\d+\s+(.+)$', line)
+            if m:
+                mtu, name = int(m.group(1)), m.group(2).strip()
+                if mtu > 1500 and _mtu_is_real_adapter(name):
+                    try:
+                        subprocess.check_call(
+                            ["netsh", "interface", "ipv4", "set", "subinterface",
+                             name, "mtu=1500", "store=persistent"],
+                            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            creationflags=NO_WIN
+                        )
+                        fixed.append(name)
+                    except Exception:
+                        failed.append(name)
+        if fixed:
+            return True, f"MTU set to 1500 on: {', '.join(fixed)}"
+        if failed:
+            return False, f"Could not set MTU on: {', '.join(failed)} — re-run as Administrator"
+        return None, "No adapters needed MTU adjustment"
+    except Exception as e:
+        return False, f"MTU fix failed: {e}"
+
+
+def check_teredo_6to4():
+    """Check for Teredo/6to4/ISATAP tunnel adapters that can interfere with routing."""
+    try:
+        out = subprocess.check_output(
+            ["netsh", "interface", "teredo", "show", "state"],
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore")
+        teredo_active = bool(re.search(r'State\s*:\s*(qualified|active|dormant)', out, re.IGNORECASE))
+
+        # Also check ipconfig for 6to4 / ISATAP adapters
+        ipc = subprocess.check_output(
+            ["ipconfig"], stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore")
+        tunnel_adapters = re.findall(
+            r'adapter\s+((?:6TO4|isatap|Teredo)[^:]+):', ipc, re.IGNORECASE)
+
+        issues = []
+        if teredo_active:
+            issues.append("Teredo tunneling is active")
+        issues.extend(tunnel_adapters)
+
+        if issues:
+            return None, (f"Tunnel adapter(s) detected: {'; '.join(issues)} — "
+                          f"can cause routing conflicts with Xlink Kai")
+        return True, "No Teredo/6to4/ISATAP tunnel adapters active"
+    except Exception as e:
+        return None, f"Tunnel adapter check failed: {e}"
+
+
+def check_kai_version():
+    """Read Xlink Kai installed version from the Windows registry."""
+    import winreg
+    reg_paths = [
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\XLink Kai"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\XLink Kai"),
+        (winreg.HKEY_CURRENT_USER,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\XLink Kai"),
+    ]
+    for hive, path in reg_paths:
+        try:
+            key = winreg.OpenKey(hive, path)
+            version = winreg.QueryValueEx(key, "DisplayVersion")[0]
+            winreg.CloseKey(key)
+            return True, f"Xlink Kai {version} is installed"
+        except OSError:
+            continue
+    # Fallback: look for the executable
+    for exe in [r"C:\Program Files (x86)\XLink Kai\kaiEngine.exe",
+                r"C:\Program Files\XLink Kai\kaiEngine.exe",
+                r"C:\XLink Kai\kaiEngine.exe"]:
+        if os.path.exists(exe):
+            return None, f"Xlink Kai found (version unknown) — reinstall to register version"
+    return False, "Xlink Kai does not appear to be installed — download from teamxlink.co.uk"
+
+
 def add_firewall_rules():
     """Add Windows Firewall inbound rules for UDP 3074 and 30000."""
     results = []
@@ -989,15 +1180,11 @@ class DiagnosticsWindow(tk.Toplevel):
         tk.Label(hdr, text="Automatic checks for common Xlink Kai / Rainbow Six setup issues",
                  font=("Segoe UI", 9), bg=ACC, fg=DIM).pack()
 
-        # Check results area
-        res_frame = tk.Frame(self, bg=BG, padx=16, pady=8)
-        res_frame.pack(fill=tk.X)
-
         # Scrollable results list
-        list_frame = tk.Frame(self, bg=BG, padx=16)
+        list_frame = tk.Frame(self, bg=BG, padx=16, pady=8)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.result_canvas = tk.Canvas(list_frame, bg=BG, highlightthickness=0, height=340)
+        self.result_canvas = tk.Canvas(list_frame, bg=BG, highlightthickness=0, height=280)
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical",
                                    command=self.result_canvas.yview)
         self.result_canvas.configure(yscrollcommand=scrollbar.set)
@@ -1024,13 +1211,13 @@ class DiagnosticsWindow(tk.Toplevel):
         tk.Label(self, text="Fix Log:", font=("Segoe UI", 9, "bold"),
                  bg=BG, fg=FG, anchor="w").pack(fill=tk.X, padx=16, pady=(6, 2))
         log_frame = tk.Frame(self, bg=BG, padx=16)
-        log_frame.pack(fill=tk.X)
+        log_frame.pack(fill=tk.BOTH, expand=True)
         self.flog = scrolledtext.ScrolledText(
-            log_frame, height=5, width=70,
+            log_frame, height=9, width=70,
             bg="#0d0d1a", fg="#00ff88",
             font=("Consolas", 8), relief=tk.FLAT, borderwidth=0,
             state=tk.DISABLED)
-        self.flog.pack(fill=tk.X)
+        self.flog.pack(fill=tk.BOTH, expand=True)
 
         # Buttons
         bf = tk.Frame(self, bg=BG, padx=16, pady=10)
@@ -1134,14 +1321,19 @@ class DiagnosticsWindow(tk.Toplevel):
         checks = [
             ("admin",            "Admin Privileges"),
             ("net_profile",      "Network Profile"),
+            ("kai_version",      "Xlink Kai Installed"),
             ("xlink_running",    "Xlink Kai Running"),
             ("webui",            "Xlink Kai Web UI"),
             ("orbital",          "Orbital Server Ping"),
             ("vpn",              "VPN Interference"),
+            ("teredo",           "Tunnel Adapters"),
             ("ics",              "Connection Sharing"),
             ("adapters",         "Network Adapters"),
+            ("mtu",              "MTU Size"),
             ("xbox",             "Xbox on Network"),
             ("double_nat",       "Double NAT"),
+            ("upnp_conflict",    "UPnP Port Conflicts"),
+            ("port_conflict",    "Local Port Conflicts"),
             ("fw_ports",         "Firewall UDP 3074/30000"),
             ("fw_kaiengine",     "Firewall kaiEngine.exe"),
         ]
@@ -1166,7 +1358,12 @@ class DiagnosticsWindow(tk.Toplevel):
         ok, msg = check_network_profile()
         upd("net_profile", ok, msg)
 
-        # 3. Xlink Kai running
+        # 3. Xlink Kai version / installed check
+        prog("Checking Xlink Kai installation...")
+        ok, msg = check_kai_version()
+        upd("kai_version", ok, msg)
+
+        # 4. Xlink Kai running
         prog("Checking if Xlink Kai is running...")
         ok, msg = check_xlink_running()
         upd("xlink_running", ok, msg)
@@ -1181,17 +1378,22 @@ class DiagnosticsWindow(tk.Toplevel):
         ok, msg = check_orbital_ping()
         upd("orbital", ok, msg)
 
-        # 4. VPN check
+        # 5. VPN check
         prog("Checking for active VPN...")
         ok, msg = check_vpn_active()
         upd("vpn", ok, msg)
 
-        # 5. ICS check
+        # 6. Teredo/6to4 tunnel adapters
+        prog("Checking for tunnel adapters...")
+        ok, msg = check_teredo_6to4()
+        upd("teredo", ok, msg)
+
+        # 7. ICS check
         prog("Checking Internet Connection Sharing...")
         ok, msg = check_connection_sharing()
         upd("ics", ok, msg)
 
-        # 6. Adapter check
+        # 8. Adapter check
         prog("Checking network adapters...")
         adapters = check_network_adapters()
         if not adapters:
@@ -1209,12 +1411,17 @@ class DiagnosticsWindow(tk.Toplevel):
                 upd("adapters", True,
                     f"Wired adapter active: {wired[0] if wired else 'OK'}")
 
-        # 7. Xbox on network
+        # 9. MTU size
+        prog("Checking MTU size on network adapters...")
+        ok, msg = check_mtu()
+        upd("mtu", ok, msg)
+
+        # 10. Xbox on network
         prog("Scanning for Xbox on network...")
         ok, msg = check_xbox_on_network()
         upd("xbox", ok, msg)
 
-        # 8. Double NAT (uses already-discovered ctrl/stype from main window)
+        # 11. Double NAT (uses already-discovered ctrl/stype from main window)
         prog("Checking for double NAT...")
         ok, msg = check_double_nat(
             getattr(self._app, "ctrl", None),
@@ -1222,7 +1429,20 @@ class DiagnosticsWindow(tk.Toplevel):
         )
         upd("double_nat", ok, msg)
 
-        # 9 & 10 share a single netsh call
+        # 12. UPnP conflict (ports mapped to different device on router)
+        prog("Checking for conflicting UPnP mappings on router...")
+        ok, msg = check_upnp_conflicts(
+            getattr(self._app, "ctrl", None),
+            getattr(self._app, "stype", None)
+        )
+        upd("upnp_conflict", ok, msg)
+
+        # 13. Local port conflict (another process using 3074/30000)
+        prog("Checking for local port conflicts...")
+        ok, msg = check_port_conflict()
+        upd("port_conflict", ok, msg)
+
+        # 14 & 15 share a single netsh call
         prog("Checking Windows Firewall rules...")
         fw_rules_cache = get_all_firewall_rules()
 
@@ -1302,6 +1522,38 @@ class DiagnosticsWindow(tk.Toplevel):
             self._flog(f"  {msg}", color)
             if ok:
                 fixed += 1
+
+        if "mtu" in self._issues:
+            self._flog("Setting MTU to 1500 on high-MTU adapters...", "#88aaff")
+            ok, msg = fix_mtu()
+            color = "#00ff88" if ok else ("#ffaa44" if ok is None else "#ff4466")
+            self._flog(f"  {msg}", color)
+            if ok:
+                fixed += 1
+
+        if "teredo" in self._issues:
+            self._flog("Teredo/6to4 tunnel adapter detected — manual steps to disable:", "#ffaa44")
+            self._flog("  1. Open Command Prompt as Administrator", "#ffaa44")
+            self._flog("  2. Run: netsh interface teredo set state disabled", "#ffaa44")
+            self._flog("  3. Run: netsh interface 6to4 set state disabled", "#ffaa44")
+            self._flog("  4. Restart your PC and re-run diagnostics", "#ffaa44")
+
+        if "port_conflict" in self._issues:
+            self._flog("Local port conflict on 3074 or 30000:", "#ffaa44")
+            self._flog("  Another app is using these ports. To identify it,", "#ffaa44")
+            self._flog("  open CMD as Administrator and run:", "#ffaa44")
+            self._flog("    netstat -ano | findstr \":3074\"", "#88aaff")
+            self._flog("    netstat -ano | findstr \":30000\"", "#88aaff")
+            self._flog("  Note the PID, then find it in Task Manager and close it.", "#ffaa44")
+
+        if "upnp_conflict" in self._issues:
+            self._flog("UPnP conflict — ports mapped to a different device on your router:", "#ffaa44")
+            self._flog("  Open your router admin page and delete the existing", "#ffaa44")
+            self._flog("  port mappings for UDP 3074 and 30000, then re-open ports.", "#ffaa44")
+
+        if "kai_version" in self._issues:
+            self._flog("Xlink Kai not installed — download from:", "#ffaa44")
+            self._flog("  https://www.teamxlink.co.uk/", "#88aaff")
 
         if "vpn" in self._issues:
             self._flog("VPN detected — please disable your VPN manually then re-run diagnostics.", "#ffaa44")
