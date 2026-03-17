@@ -17,6 +17,7 @@ import re
 import subprocess
 import os
 import sys
+import ctypes
 
 # ── Subprocess flag ────────────────────────────────────────────────────────────
 NO_WIN = subprocess.CREATE_NO_WINDOW
@@ -543,8 +544,9 @@ class RouterGuideWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Router Setup Guide")
-        self.resizable(False, False)
-        self.configure(bg="#1a1a2e")
+        self.resizable(True, True)
+        self.minsize(480, 460)
+        self.configure(bg=BG)
         self.grab_set()
 
         hdr = tk.Frame(self, bg=ACC, pady=10)
@@ -801,6 +803,87 @@ def check_connection_sharing():
         return None, f"ICS check failed: {e}"
 
 
+def check_admin():
+    """Check if the process is running with Administrator privileges."""
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        if is_admin:
+            return True, "Running as Administrator — Auto-Fix has full permissions"
+        return False, "Not running as Administrator — Auto-Fix (firewall rules) may fail"
+    except Exception as e:
+        return None, f"Could not check admin status: {e}"
+
+
+def check_double_nat(ctrl, stype):
+    """Check if the user is behind double NAT.
+
+    Double NAT means the router's own WAN IP is a private address, indicating
+    an upstream modem/router.  UPnP only opens ports on the first device — the
+    outer NAT layer still blocks traffic and Xlink Kai will not connect.
+    """
+    if not ctrl or not stype:
+        return None, "Router not detected — run Re-detect Router first"
+    try:
+        ext_ip = get_ext_ip(ctrl, stype)
+        if ext_ip == "Unknown":
+            return None, "Could not retrieve external IP from router"
+        parts = ext_ip.split(".")
+        if len(parts) != 4:
+            return None, f"Unexpected IP format: {ext_ip}"
+        first, second = int(parts[0]), int(parts[1])
+        is_private = (
+            first == 10 or
+            (first == 172 and 16 <= second <= 31) or
+            (first == 192 and second == 168)
+        )
+        if is_private:
+            return False, (f"Double NAT detected — router WAN IP {ext_ip} is a private address. "
+                           f"Enable bridge/passthrough mode on your ISP modem to fix this.")
+        return True, f"No double NAT — external IP {ext_ip} is a public address"
+    except Exception as e:
+        return None, f"Double NAT check failed: {e}"
+
+
+def check_network_profile():
+    """Check if Windows network profile is set to Public.
+
+    Public profile applies stricter firewall rules and can block Xlink Kai
+    traffic even when port rules exist.  Private or Domain is required.
+    """
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-NetConnectionProfile | Select-Object -ExpandProperty NetworkCategory"],
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore").strip()
+        profiles = [p.strip() for p in out.splitlines() if p.strip()]
+        if not profiles:
+            return None, "Could not determine network profile"
+        if "Public" in profiles:
+            return False, ("Network set to Public profile — change to Private so Windows "
+                           "allows Xlink Kai traffic through the firewall")
+        return True, f"Network profile: {', '.join(profiles)} — OK"
+    except Exception as e:
+        return None, f"Network profile check failed: {e}"
+
+
+def fix_network_profile():
+    """Attempt to set all Public network profiles to Private via PowerShell."""
+    try:
+        subprocess.check_call(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-NetConnectionProfile | Where-Object {$_.NetworkCategory -eq 'Public'} "
+             "| Set-NetConnectionProfile -NetworkCategory Private"],
+            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            creationflags=NO_WIN
+        )
+        return True, "Network profile changed to Private"
+    except subprocess.CalledProcessError:
+        return False, "Failed to change profile — re-run as Administrator"
+    except Exception as e:
+        return False, f"Could not change network profile: {e}"
+
+
 def check_vpn_active():
     """Check if a VPN adapter is active (VPNs break Xlink Kai)."""
     vpn_keywords = ["vpn","nordvpn","expressvpn","proton","mullvad","wireguard","openvpn","tap-windows","tun"]
@@ -887,11 +970,16 @@ class DiagnosticsWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Xlink Kai Diagnostics")
-        self.resizable(False, False)
-        self.configure(bg="#1a1a2e")
+        self.resizable(True, True)
+        self.minsize(720, 540)
+        self.geometry("800x700")
+        self.configure(bg=BG)
         self.grab_set()
 
+        self._app = parent          # reference to App for ctrl/stype access
         self._log_tag = 0
+        self._msg_labels = []       # track message labels for wraplength updates
+        self.bind("<Configure>", self._on_resize)
 
         # Header
         hdr = tk.Frame(self, bg=ACC, pady=10)
@@ -976,11 +1064,22 @@ class DiagnosticsWindow(tk.Toplevel):
         self.flog.see(tk.END)
         self.flog.configure(state=tk.DISABLED)
 
+    def _on_resize(self, event=None):
+        """Update message label wraplengths when the window is resized."""
+        # 260px reserved for icon + name label + padding
+        wl = max(200, self.winfo_width() - 260)
+        for lbl in self._msg_labels:
+            try:
+                lbl.configure(wraplength=wl)
+            except tk.TclError:
+                pass
+
     def _clear_results(self):
         for w in self.inner.winfo_children():
             w.destroy()
         self._rows = {}
         self._issues = []
+        self._msg_labels = []
 
     def _add_row(self, key, label):
         """Add a check row with pending status."""
@@ -993,9 +1092,11 @@ class DiagnosticsWindow(tk.Toplevel):
         tk.Label(frame, textvariable=icon_var, font=("Segoe UI", 11),
                  bg=CARD, width=2).pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(frame, text=label, font=("Segoe UI", 9, "bold"),
-                 bg=CARD, fg=FG, width=28, anchor="w").pack(side=tk.LEFT)
-        tk.Label(frame, textvariable=msg_var, font=("Segoe UI", 9),
-                 bg=CARD, fg=DIM, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+                 bg=CARD, fg=FG, width=22, anchor="w").pack(side=tk.LEFT)
+        msg_lbl = tk.Label(frame, textvariable=msg_var, font=("Segoe UI", 9),
+                           bg=CARD, fg=DIM, anchor="w", wraplength=480)
+        msg_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._msg_labels.append(msg_lbl)
 
         self._rows[key] = (icon_var, msg_var, frame)
 
@@ -1031,6 +1132,8 @@ class DiagnosticsWindow(tk.Toplevel):
         self._clear_results()
 
         checks = [
+            ("admin",            "Admin Privileges"),
+            ("net_profile",      "Network Profile"),
             ("xlink_running",    "Xlink Kai Running"),
             ("webui",            "Xlink Kai Web UI"),
             ("orbital",          "Orbital Server Ping"),
@@ -1038,6 +1141,7 @@ class DiagnosticsWindow(tk.Toplevel):
             ("ics",              "Connection Sharing"),
             ("adapters",         "Network Adapters"),
             ("xbox",             "Xbox on Network"),
+            ("double_nat",       "Double NAT"),
             ("fw_ports",         "Firewall UDP 3074/30000"),
             ("fw_kaiengine",     "Firewall kaiEngine.exe"),
         ]
@@ -1052,7 +1156,17 @@ class DiagnosticsWindow(tk.Toplevel):
         def prog(msg):
             self.after(0, lambda: self.progress_var.set(msg))
 
-        # 1. Xlink Kai running
+        # 1. Admin privileges
+        prog("Checking administrator privileges...")
+        ok, msg = check_admin()
+        upd("admin", ok, msg)
+
+        # 2. Network profile (Public blocks traffic)
+        prog("Checking Windows network profile...")
+        ok, msg = check_network_profile()
+        upd("net_profile", ok, msg)
+
+        # 3. Xlink Kai running
         prog("Checking if Xlink Kai is running...")
         ok, msg = check_xlink_running()
         upd("xlink_running", ok, msg)
@@ -1100,7 +1214,15 @@ class DiagnosticsWindow(tk.Toplevel):
         ok, msg = check_xbox_on_network()
         upd("xbox", ok, msg)
 
-        # 8 & 9 share a single netsh call
+        # 8. Double NAT (uses already-discovered ctrl/stype from main window)
+        prog("Checking for double NAT...")
+        ok, msg = check_double_nat(
+            getattr(self._app, "ctrl", None),
+            getattr(self._app, "stype", None)
+        )
+        upd("double_nat", ok, msg)
+
+        # 9 & 10 share a single netsh call
         prog("Checking Windows Firewall rules...")
         fw_rules_cache = get_all_firewall_rules()
 
@@ -1143,6 +1265,26 @@ class DiagnosticsWindow(tk.Toplevel):
 
     def _do_fixes(self):
         fixed = 0
+
+        if "admin" in self._issues:
+            self._flog("Not running as Administrator:", "#ffaa44")
+            self._flog("  Close this tool, right-click Run_XlinkPortOpener.bat", "#ffaa44")
+            self._flog("  and select 'Run as administrator'.", "#ffaa44")
+
+        if "net_profile" in self._issues:
+            self._flog("Changing network profile from Public to Private...", "#88aaff")
+            ok, msg = fix_network_profile()
+            color = "#00ff88" if ok else "#ff4466"
+            self._flog(f"  {msg}", color)
+            if ok:
+                fixed += 1
+
+        if "double_nat" in self._issues:
+            self._flog("Double NAT detected — this requires a manual fix:", "#ffaa44")
+            self._flog("  1. Log into your ISP modem/gateway admin page", "#ffaa44")
+            self._flog("  2. Enable Bridge Mode or IP Passthrough", "#ffaa44")
+            self._flog("  3. This lets your router handle NAT directly", "#ffaa44")
+            self._flog("  4. Contact your ISP if you cannot find this setting", "#ffaa44")
 
         if "fw_ports" in self._issues:
             self._flog("Adding Windows Firewall rules for UDP 3074 & 30000...", "#88aaff")
