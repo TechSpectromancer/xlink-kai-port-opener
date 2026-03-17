@@ -379,25 +379,62 @@ ROUTERS = {
 }
 
 
+def _get_default_gateway():
+    """Return the default gateway IP by parsing ipconfig output."""
+    try:
+        out = subprocess.check_output(
+            ["ipconfig"], stderr=subprocess.DEVNULL, creationflags=NO_WIN
+        ).decode(errors="ignore")
+        for line in out.splitlines():
+            if "Default Gateway" in line:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                if m and not m.group(1).startswith("0."):
+                    return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
 def discover_gateway(timeout=8):
     """Send M-SEARCH probes for multiple service types, retrying each twice.
 
-    Some routers (e.g. ASUS) silently drop the first packet or only respond
-    to specific ST values.  Sending a burst across all common types and
-    listening for the full window catches these cases.
+    Strategy:
+    - Bind to the local IP so the correct network interface is used
+    - Send multicast AND unicast (to default gateway) for each service type —
+      many routers ignore multicast but respond to unicast on port 1900
+    - Each probe is sent twice to handle routers that drop the first packet
+    - Responses are collected for the full timeout window
     """
+    local_ip = get_local_ip()
+    gateway_ip = _get_default_gateway()
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+    # Bind to the local IP so multicast/responses use the correct interface
     try:
-        # Burst all service-type probes, each sent twice with a short gap
+        sock.bind((local_ip, 0))
+    except Exception:
+        try:
+            sock.bind(('', 0))
+        except Exception:
+            pass
+
+    # Build target list: always multicast, plus unicast to gateway if known
+    targets = [(SSDP_ADDR, SSDP_PORT)]
+    if gateway_ip:
+        targets.append((gateway_ip, SSDP_PORT))
+
+    try:
         for st in SSDP_ST_LIST:
             req = _ssdp_request(st)
-            for _ in range(2):
-                try:
-                    sock.sendto(req, (SSDP_ADDR, SSDP_PORT))
-                except Exception:
-                    pass
-                time.sleep(0.05)
+            for target in targets:
+                for _ in range(2):
+                    try:
+                        sock.sendto(req, target)
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
 
         # Collect responses until the deadline
         deadline = time.monotonic() + timeout
