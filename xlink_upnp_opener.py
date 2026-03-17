@@ -18,16 +18,44 @@ import subprocess
 import os
 import sys
 
-SSDP_ADDR = "239.255.255.250"
-SSDP_PORT = 1900
-SSDP_ST   = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
-SSDP_REQUEST = (
-    "M-SEARCH * HTTP/1.1\r\n"
-    f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
-    "MAN: \"ssdp:discover\"\r\n"
-    "MX: 2\r\n"
-    f"ST: {SSDP_ST}\r\n\r\n"
-)
+# ── Subprocess flag ────────────────────────────────────────────────────────────
+NO_WIN = subprocess.CREATE_NO_WINDOW
+
+# ── UI colour palette ──────────────────────────────────────────────────────────
+BG   = "#1a1a2e"
+CARD = "#16213e"
+ACC  = "#0f3460"
+GOLD = "#e94560"
+FG   = "#eaeaea"
+DIM  = "#8888aa"
+GRN  = "#00ff88"
+
+# ── Port definitions ───────────────────────────────────────────────────────────
+PORTS = [
+    (3074,  "UDP", "Xlink Kai Xbox"),
+    (30000, "UDP", "Xlink Kai Tunnel"),
+]
+
+# ── SSDP discovery constants ───────────────────────────────────────────────────
+SSDP_ADDR    = "239.255.255.250"
+SSDP_PORT    = 1900
+# Multiple service types tried in order; covers IGD v1/v2 and direct WAN services
+SSDP_ST_LIST = [
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANIPConnection:2",
+    "ssdp:all",
+]
+
+def _ssdp_request(st):
+    return (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 3\r\n"
+        f"ST: {st}\r\n\r\n"
+    ).encode()
 
 # ── Watermark Canvas Logo ─────────────────────────────────────────────────────
 def draw_watermark(parent, bg="#1a1a2e"):
@@ -351,19 +379,43 @@ ROUTERS = {
 }
 
 
-def discover_gateway(timeout=3):
+def discover_gateway(timeout=8):
+    """Send M-SEARCH probes for multiple service types, retrying each twice.
+
+    Some routers (e.g. ASUS) silently drop the first packet or only respond
+    to specific ST values.  Sending a burst across all common types and
+    listening for the full window catches these cases.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.settimeout(timeout)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
     try:
-        sock.sendto(SSDP_REQUEST.encode(), (SSDP_ADDR, SSDP_PORT))
+        # Burst all service-type probes, each sent twice with a short gap
+        for st in SSDP_ST_LIST:
+            req = _ssdp_request(st)
+            for _ in range(2):
+                try:
+                    sock.sendto(req, (SSDP_ADDR, SSDP_PORT))
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        # Collect responses until the deadline
+        deadline = time.monotonic() + timeout
+        seen = set()
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
             try:
                 data, addr = sock.recvfrom(65507)
                 response = data.decode("utf-8", errors="ignore")
                 for line in response.splitlines():
                     if line.strip().lower().startswith("location:"):
-                        return line.split(":", 1)[1].strip(), addr[0]
+                        loc = line.split(":", 1)[1].strip()
+                        if loc not in seen:
+                            seen.add(loc)
+                            return loc, addr[0]
             except socket.timeout:
                 break
     finally:
@@ -395,10 +447,11 @@ def soap_action(url, stype, action, args=""):
             f'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
             f' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
             f'<s:Body><u:{action} xmlns:u="{stype}">{args}</u:{action}></s:Body></s:Envelope>')
-    req = urllib.request.Request(url, data=body.encode(), method="POST",
+    encoded = body.encode()
+    req = urllib.request.Request(url, data=encoded, method="POST",
         headers={"Content-Type": "text/xml; charset=utf-8",
                  "SOAPAction": f'"{stype}#{action}"',
-                 "Content-Length": str(len(body.encode()))})
+                 "Content-Length": str(len(encoded))})
     try:
         with urllib.request.urlopen(req, timeout=8) as r:
             return r.read().decode("utf-8", errors="ignore"), r.status
@@ -456,9 +509,6 @@ class RouterGuideWindow(tk.Toplevel):
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
         self.grab_set()
-
-        BG=  "#1a1a2e"; CARD="#16213e"; ACC="#0f3460"
-        GOLD="#e94560";  FG="#eaeaea";  DIM="#8888aa"; GRN="#00ff88"
 
         hdr = tk.Frame(self, bg=ACC, pady=10)
         hdr.pack(fill=tk.X)
@@ -545,13 +595,13 @@ def check_xlink_running():
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq kaiEngine.exe", "/NH"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
         if "kaiEngine.exe" in out:
             return True, "kaiEngine.exe is running"
         # Also check for XLinkKai.exe
         out2 = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq XLinkKai.exe", "/NH"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
         if "XLinkKai.exe" in out2:
             return True, "XLinkKai.exe is running"
         return False, "Xlink Kai is NOT running (kaiEngine.exe not found)"
@@ -570,40 +620,52 @@ def check_xlink_webui():
         return False, f"Web UI check failed: {e}"
 
 
-def check_firewall_ports():
-    """Check Windows Firewall for UDP 3074 and 30000 rules."""
-    results = []
-    # Fetch ALL rules once then search locally - more reliable than per-port query
+def get_all_firewall_rules():
+    """Fetch all inbound Windows Firewall rules once and return the raw text.
+
+    Both check_firewall_ports and check_kaiengine_firewall accept this cached
+    text so the expensive netsh call is only made once per diagnostic run.
+    Returns empty string on failure (callers handle the empty case).
+    """
     try:
-        all_rules = subprocess.check_output(
+        return subprocess.check_output(
             ["netsh", "advfirewall", "firewall", "show", "rule", "name=all",
              "dir=in", "verbose"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore").lower()
-    except Exception as e:
-        for port in [3074, 30000]:
-            results.append((None, port, f"Could not query firewall rules: {e}"))
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
+    except Exception:
+        return ""
+
+
+def check_firewall_ports(rules_text=None):
+    """Check Windows Firewall for UDP 3074 and 30000 rules."""
+    if rules_text is None:
+        rules_text = get_all_firewall_rules()
+
+    results = []
+    if not rules_text:
+        for port, _, _ in PORTS:
+            results.append((None, port, f"Could not query firewall rules"))
         return results
 
-    for port in [3074, 30000]:
+    all_rules = rules_text.lower()
+    blocks = all_rules.split("rule name:")
+
+    for port, _, _ in PORTS:
         port_str = str(port)
-        # Check by our known rule name first
         rule_name = f"xlink kai udp {port_str}"
-        # Also check for any rule containing this port number in localport field
         found = False
         enabled = False
 
-        # Split into individual rule blocks
-        blocks = all_rules.split("rule name:")
         for block in blocks:
-            # Match port in LocalPort field
-            has_port = (f"localport:{' '*20}{port_str}" in block or
-                        f"localport:                    {port_str}" in block or
-                        f"localport:                    {port_str}," in block or
-                        f"localport:                    any" in block and rule_name in block or
-                        rule_name in block)
+            # Use regex so whitespace differences between Windows versions don't matter
+            has_port = bool(
+                re.search(r'localport:\s+' + re.escape(port_str) + r'(,|\s|$)', block)
+            ) or (
+                re.search(r'localport:\s+any', block) and rule_name in block
+            ) or rule_name in block
             if has_port and "udp" in block:
                 found = True
-                enabled = "enabled:                              yes" in block
+                enabled = bool(re.search(r'enabled:\s+yes', block))
                 break
 
         if found and enabled:
@@ -611,29 +673,21 @@ def check_firewall_ports():
         elif found and not enabled:
             results.append((None, port, f"Firewall rule exists for UDP {port} but is disabled"))
         else:
-            # Last resort: simple string search for port number near UDP
-            simple_match = (f"localport:                    {port_str}" in all_rules or
-                           f"xlink kai udp {port_str}" in all_rules)
-            if simple_match:
-                results.append((True, port, f"Firewall rule found for UDP {port}"))
-            else:
-                results.append((False, port, f"No firewall rule found for UDP {port}"))
+            results.append((False, port, f"No firewall rule found for UDP {port}"))
 
     return results
 
 
-def check_kaiengine_firewall():
+def check_kaiengine_firewall(rules_text=None):
     """Check if kaiEngine.exe has a Windows Firewall exception."""
-    try:
-        out = subprocess.check_output(
-            ["netsh", "advfirewall", "firewall", "show", "rule", "name=all"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
-        has_kai = "kaiengine" in out.lower() or "xlink" in out.lower()
-        if has_kai:
-            return True, "kaiEngine.exe has a Windows Firewall exception"
-        return False, "No firewall exception found for kaiEngine.exe"
-    except Exception as e:
-        return None, f"Could not check kaiEngine firewall rule: {e}"
+    if rules_text is None:
+        rules_text = get_all_firewall_rules()
+    if not rules_text:
+        return None, "Could not query firewall rules"
+    has_kai = "kaiengine" in rules_text.lower() or "xlink" in rules_text.lower()
+    if has_kai:
+        return True, "kaiEngine.exe has a Windows Firewall exception"
+    return False, "No firewall exception found for kaiEngine.exe"
 
 
 def check_network_adapters():
@@ -641,7 +695,7 @@ def check_network_adapters():
     try:
         out = subprocess.check_output(
             ["netsh", "interface", "show", "interface"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
         lines = [l for l in out.splitlines() if "Connected" in l]
         adapters = []
         for line in lines:
@@ -663,7 +717,7 @@ def check_xbox_on_network():
     try:
         out = subprocess.check_output(
             ["arp", "-a"], stderr=subprocess.DEVNULL,
-            creationflags=0x08000000).decode(errors="ignore")
+            creationflags=NO_WIN).decode(errors="ignore")
         found = []
         for line in out.splitlines():
             line_low = line.lower().replace("-",":")
@@ -685,7 +739,7 @@ def check_orbital_ping():
     try:
         out = subprocess.check_output(
             ["ping", "-n", "3", "-w", "2000", orbital],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
         if "TTL=" in out or "ttl=" in out.lower():
             # Extract avg ms
             m = re.search(r"Average = (\d+)ms", out)
@@ -701,7 +755,7 @@ def check_connection_sharing():
     try:
         out = subprocess.check_output(
             ["netsh", "interface", "ipv4", "show", "addresses"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
         # ICS host typically assigns 192.168.137.x
         if "192.168.137" in out:
             return False, "Internet Connection Sharing (ICS) may be active - can interfere with Xlink Kai"
@@ -716,7 +770,7 @@ def check_vpn_active():
     try:
         out = subprocess.check_output(
             ["ipconfig", "/all"],
-            stderr=subprocess.DEVNULL, creationflags=0x08000000).decode(errors="ignore")
+            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
         found = []
         current = ""
         for line in out.splitlines():
@@ -741,11 +795,11 @@ def add_firewall_rules():
         rule_name = f"Xlink Kai UDP {port}"
         try:
             # Delete existing rule first to avoid duplicates
-            subprocess.call([
+            subprocess.run([
                 "netsh", "advfirewall", "firewall", "delete", "rule",
                 f"name={rule_name}"
             ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-               creationflags=0x08000000)
+               creationflags=NO_WIN)
             # Add fresh rule
             subprocess.check_call([
                 "netsh", "advfirewall", "firewall", "add", "rule",
@@ -754,7 +808,7 @@ def add_firewall_rules():
                 f"localport={port}", "enable=yes",
                 "profile=any"
             ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-               creationflags=0x08000000)
+               creationflags=NO_WIN)
             results.append((True, port, f"Firewall rule added for UDP {port}"))
         except subprocess.CalledProcessError:
             results.append((False, port, f"Failed to add rule for UDP {port} (run as Administrator)"))
@@ -785,7 +839,7 @@ def add_kaiengine_exception():
             "dir=in", "action=allow", "protocol=any",
             f"program={kai_path}", "enable=yes", "profile=any"
         ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-           creationflags=0x08000000)
+           creationflags=NO_WIN)
         return True, f"Firewall exception added for kaiEngine.exe"
     except Exception as e:
         return False, f"Failed to add exception: {e}"
@@ -800,8 +854,7 @@ class DiagnosticsWindow(tk.Toplevel):
         self.configure(bg="#1a1a2e")
         self.grab_set()
 
-        BG="#1a1a2e"; CARD="#16213e"; ACC="#0f3460"
-        GOLD="#e94560"; FG="#eaeaea"; DIM="#8888aa"
+        self._log_tag = 0
 
         # Header
         hdr = tk.Frame(self, bg=ACC, pady=10)
@@ -879,7 +932,8 @@ class DiagnosticsWindow(tk.Toplevel):
 
     def _flog(self, msg, color="#00ff88"):
         self.flog.configure(state=tk.NORMAL)
-        tag = f"t{time.time()}"
+        self._log_tag += 1
+        tag = f"t{self._log_tag}"
         self.flog.insert(tk.END, msg + "\n", tag)
         self.flog.tag_config(tag, foreground=color)
         self.flog.see(tk.END)
@@ -893,7 +947,6 @@ class DiagnosticsWindow(tk.Toplevel):
 
     def _add_row(self, key, label):
         """Add a check row with pending status."""
-        BG="#1a1a2e"; CARD="#16213e"; DIM="#8888aa"; FG="#eaeaea"
         frame = tk.Frame(self.inner, bg=CARD, pady=4, padx=12)
         frame.pack(fill=tk.X, pady=2, padx=4)
 
@@ -1010,21 +1063,22 @@ class DiagnosticsWindow(tk.Toplevel):
         ok, msg = check_xbox_on_network()
         upd("xbox", ok, msg)
 
-        # 8. Firewall ports
-        prog("Checking Windows Firewall for UDP 3074 & 30000...")
-        fw_results = check_firewall_ports()
+        # 8 & 9 share a single netsh call
+        prog("Checking Windows Firewall rules...")
+        fw_rules_cache = get_all_firewall_rules()
+
+        fw_results = check_firewall_ports(fw_rules_cache)
         all_ok = all(r[0] is True for r in fw_results)
         any_missing = any(r[0] is False for r in fw_results)
         summary = "  |  ".join(
             f"UDP {r[1]}: {'OK' if r[0] is True else 'MISSING'}" for r in fw_results)
-        # Missing = red fail (fixable), unknown = yellow warning
         upd("fw_ports",
             True if all_ok else (False if any_missing else None),
             summary)
 
-        # 9. kaiEngine firewall exception
+        # 9. kaiEngine firewall exception (reuses cached rules)
         prog("Checking kaiEngine.exe firewall exception...")
-        ok, msg = check_kaiengine_firewall()
+        ok, msg = check_kaiengine_firewall(fw_rules_cache)
         upd("fw_kaiengine", ok, msg)
 
         # Done
@@ -1098,14 +1152,12 @@ class App(tk.Tk):
         super().__init__()
         self.title("Xlink Kai Port Opener  v2")
         self.resizable(False, False)
-        self.configure(bg="#1a1a2e")
+        self.configure(bg=BG)
         self.ctrl = self.stype = self.lip = self.gwip = None
+        self._log_tag = 0
         self._build()
 
     def _build(self):
-        BG="#1a1a2e"; CARD="#16213e"; ACC="#0f3460"
-        GOLD="#e94560"; FG="#eaeaea"; DIM="#8888aa"
-
         # ── Watermark header banner ───────────────────────────────────────────
         wm = draw_watermark(self, bg=ACC)
         wm.pack(fill=tk.X, padx=0, pady=0)
@@ -1177,7 +1229,8 @@ class App(tk.Tk):
 
     def _log(self, msg, color=None):
         self.log.configure(state=tk.NORMAL)
-        tag = f"t{time.time()}"
+        self._log_tag += 1
+        tag = f"t{self._log_tag}"
         self.log.insert(tk.END, msg + "\n", tag)
         if color:
             self.log.tag_config(tag, foreground=color)
@@ -1194,11 +1247,12 @@ class App(tk.Tk):
         threading.Thread(target=self._detect, daemon=True).start()
 
     def _detect(self):
-        self._inf("Scanning for router via UPnP...")
+        self._inf("Scanning for router via UPnP (trying multiple service types)...")
+        self._inf("This may take up to 8 seconds on first attempt...")
         self.vstatus.set("Scanning...")
         lip = get_local_ip()
         self.vlan.set(lip)
-        loc, gwip = discover_gateway(timeout=4)
+        loc, gwip = discover_gateway(timeout=8)
         if not loc:
             self._err("No UPnP gateway found.")
             self._inf("Click 'Router Setup Guide' for help enabling UPnP.")
@@ -1229,7 +1283,7 @@ class App(tk.Tk):
     def _open(self):
         ok = 0
         try:
-            for port, proto, desc in [(3074,"UDP","Xlink Kai Xbox"),(30000,"UDP","Xlink Kai Tunnel")]:
+            for port, proto, desc in PORTS:
                 self._inf(f"Sending request to router for {proto} {port}...")
                 resp, status = add_port(self.ctrl, self.stype, self.lip, port, proto, desc)
                 self._inf(f"Router responded: HTTP {status}")
@@ -1246,7 +1300,7 @@ class App(tk.Tk):
         except Exception as e:
             self._err(f"Unexpected error: {e}")
         finally:
-            if ok == 2:
+            if ok == len(PORTS):
                 self.vstatus.set("OPEN")
                 self._ok("Both ports open. You can close this window.")
                 self.bclose.configure(state=tk.NORMAL)
@@ -1261,8 +1315,8 @@ class App(tk.Tk):
         threading.Thread(target=self._close, daemon=True).start()
 
     def _close(self):
-        for port in [3074, 30000]:
-            _, status = del_port(self.ctrl, self.stype, port, "UDP")
+        for port, proto, _ in PORTS:
+            _, status = del_port(self.ctrl, self.stype, port, proto)
             if status in (200, 204):
                 self._ok(f"UDP {port} removed.")
             else:
