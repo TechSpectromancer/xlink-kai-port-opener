@@ -1,7 +1,7 @@
 # 🎮 Xlink Kai Port Opener
 ### Rainbow Six 3 / Black Arrow — Original Xbox
 
-> Automatic UPnP port forwarding, router setup guide, and full Xlink Kai diagnostics tool.  
+> Automatic UPnP port forwarding, router setup guide, and full Xlink Kai diagnostics tool.
 > No networking experience required. Created by **Juv3nile**
 
 ---
@@ -34,7 +34,7 @@ You only need to do this once.
 
 ## 🚀 What It Does
 
-This tool solves the three most common reasons Xlink Kai games lag, drop, or fail to connect:
+This tool solves the most common reasons Xlink Kai games lag, drop, or fail to connect:
 
 - **Opens UDP 3074 & 30000** on your router automatically via UPnP — no manual port forwarding needed
 - **Guides you through enabling UPnP** on your router if it's turned off, with step-by-step instructions for 19 router brands
@@ -80,21 +80,31 @@ The log will confirm both ports opened successfully.
 ### Step 5 — Run Diagnostics
 Click **🔍 Diagnostics** to run a full health check of your Xlink Kai setup.
 
+> **Tip:** Right-click `Run_XlinkPortOpener.bat` and choose **Run as Administrator** so the Auto-Fix feature has full permissions to correct firewall rules and network settings.
+
 ---
 
 ## 🔍 Diagnostics — What Gets Checked
 
-The diagnostics tool automatically checks 9 common setup issues:
+The diagnostics tool automatically checks 17 common setup issues:
 
 | Check | What It Looks For |
 |-------|------------------|
+| ✅ Admin Privileges | Whether the tool has admin rights for Auto-Fix to work |
+| ✅ Network Profile | Public profile blocks traffic — Auto-Fix changes it to Private |
+| ✅ Xlink Kai Installed | Installed version read from Windows registry |
 | ✅ Xlink Kai Running | Is kaiEngine.exe actually launched |
 | ✅ Xlink Kai Web UI | Can reach localhost:34522 |
 | ✅ Orbital Server Ping | Connection to Xlink Kai's servers |
 | ✅ VPN Interference | Active VPN adapters that break Xlink Kai |
+| ✅ Tunnel Adapters | Teredo/6to4/ISATAP adapters that cause routing conflicts |
 | ✅ Connection Sharing | ICS conflicts |
 | ✅ Network Adapters | WiFi vs Ethernet detection |
-| ✅ Xbox on Network | Scans for Xbox on your local network |
+| ✅ MTU Size | Adapters above MTU 1500 cause packet fragmentation — Auto-Fix corrects it |
+| ✅ Xbox on Network | Scans for Xbox on your local network via ARP |
+| ✅ Double NAT | Router WAN IP is private — means two NAT layers, UPnP alone won't fix it |
+| ✅ UPnP Port Conflicts | Ports already mapped to a different device on your router |
+| ✅ Local Port Conflicts | Another process occupying UDP 3074 or 30000 |
 | ✅ Firewall UDP 3074/30000 | Windows Firewall inbound rules |
 | ✅ Firewall kaiEngine.exe | App exception for Xlink Kai engine |
 
@@ -136,8 +146,14 @@ The built-in Router Setup Guide covers 19 router brands:
 **"Python installed but PATH not updated"**
 > Close the window and double-click the `.bat` again. This happens once after first install.
 
+**Auto-Fix didn't change anything**
+> Close the tool, right-click `Run_XlinkPortOpener.bat`, and choose **Run as Administrator**. Some fixes (firewall rules, network profile, MTU) require admin privileges.
+
+**Double NAT detected**
+> Your ISP modem and your router are both doing NAT. Log into your ISP modem and enable **Bridge Mode** or **IP Passthrough** so your router handles NAT directly. Contact your ISP if you can't find the setting.
+
 **Ports open but still lagging in Xlink Kai**
-> The lag is likely on the other players' end, not yours. Share this tool with them and have them run it too. The four most common causes on their side are: strict NAT, missing firewall rules, VPN active, or WiFi instead of Ethernet.
+> The lag may be on other players' end. Share this tool with them. The most common causes are: strict NAT, missing firewall rules, VPN active, or WiFi instead of Ethernet.
 
 ---
 
@@ -162,14 +178,15 @@ No router login required. No manual configuration. The rules persist until you r
 
 | Version | Notes |
 |---------|-------|
-| v1.0 | Initial release — UPnP port opener, router guide, full diagnostics, auto-fix |
+| v1.1 | 8 new diagnostic checks (MTU, double NAT, tunnel adapters, port conflicts, UPnP conflicts, admin check, network profile, Kai version); resizable windows; bug fixes |
+| v1.0 | Initial release — UPnP port opener, router guide, diagnostics with auto-fix |
 
 ---
 
 ## 👤 Credits
 
-**Created by Juv3nile**  
-For the Rainbow Six 3 / Black Arrow Xlink Kai community  
+**Created by Juv3nile**
+For the Rainbow Six 3 / Black Arrow Xlink Kai community
 
 ---
 

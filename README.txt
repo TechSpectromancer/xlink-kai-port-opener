@@ -1,5 +1,5 @@
 ╔══════════════════════════════════════════════════════════════╗
-║         XLINK KAI PORT OPENER - README                      ║
+║         XLINK KAI PORT OPENER v1.1 - README                 ║
 ║         Rainbow Six 3 / Black Arrow - Original Xbox         ║
 ║                                        Created by Juv3nile  ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -13,6 +13,9 @@ Xbox System Link tunneling over the internet.
 Opening them allows other players to connect directly to you
 instead of being routed through a relay server — reducing lag
 from ~1000ms down to ~30ms in ideal conditions.
+
+It also includes a full diagnostics tool that checks 17 common
+setup issues and auto-fixes the ones it can.
 
 
 ══════════════════════════════════════════════════════════════
@@ -41,6 +44,9 @@ run normally every time.
 
 Python 3 is required but installs AUTOMATICALLY on first run
 if you don't already have it. Nothing to do manually.
+
+TIP: Right-click Run_XlinkPortOpener.bat and choose
+     "Run as Administrator" so Auto-Fix has full permissions.
 
 
 ══════════════════════════════════════════════════════════════
@@ -95,6 +101,34 @@ click "Remove Rules". You can close the tool after opening.
 
 
 ══════════════════════════════════════════════════════════════
+  DIAGNOSTICS TOOL
+══════════════════════════════════════════════════════════════
+
+Click the "Diagnostics" button to run 17 automated checks:
+
+  - Admin Privileges       Are you running as Administrator
+  - Network Profile        Public profile blocks traffic
+  - Xlink Kai Installed    Version from Windows registry
+  - Xlink Kai Running      Is kaiEngine.exe launched
+  - Xlink Kai Web UI       Can reach localhost:34522
+  - Orbital Server Ping    Connection to Xlink Kai servers
+  - VPN Interference       Active VPN breaks Xlink Kai
+  - Tunnel Adapters        Teredo/6to4/ISATAP conflicts
+  - Connection Sharing     ICS can interfere with Xlink Kai
+  - Network Adapters       WiFi vs Ethernet
+  - MTU Size               Above 1500 causes fragmentation
+  - Xbox on Network        Scans ARP table for Xbox MAC
+  - Double NAT             Two NAT layers — UPnP not enough
+  - UPnP Port Conflicts    Ports mapped to another device
+  - Local Port Conflicts   Another app using 3074/30000
+  - Firewall UDP 3074/30000  Windows Firewall inbound rules
+  - Firewall kaiEngine.exe   App firewall exception
+
+Each check shows green (OK), red (problem), or yellow (warning).
+Click "Auto-Fix Issues" to automatically resolve what it can.
+
+
+══════════════════════════════════════════════════════════════
   VERIFY IT WORKED
 ══════════════════════════════════════════════════════════════
 
@@ -130,17 +164,39 @@ On your Xbox dashboard:
   → Ports are already open from a previous run. You're good.
 
 "Some ports failed":
-  → Try right-clicking the .bat and choosing
-    "Run as Administrator", then try again.
+  → Right-click the .bat and choose "Run as Administrator".
 
 "Python installed but PATH not updated":
   → Close the window and double-click the .bat again.
     This happens once after first install.
 
-Tool opens but nothing happens after clicking Open Ports:
-  → Check the log box for error messages.
-  → Make sure your router was detected (Router IP shows a
-    real address, not a dash).
+Auto-Fix didn't change anything:
+  → Close the tool, right-click Run_XlinkPortOpener.bat,
+    and choose "Run as Administrator". Firewall rules,
+    network profile, and MTU fixes require admin rights.
+
+Double NAT detected:
+  → Your ISP modem and router are both doing NAT. Log into
+    your ISP modem and enable Bridge Mode or IP Passthrough.
+    Contact your ISP if you cannot find the setting.
+
+Ports open but still lagging in Xlink Kai:
+  → The lag may be on other players' end. Share this tool
+    with them. Common causes: strict NAT, no firewall rules,
+    VPN active, or WiFi instead of Ethernet.
+
+
+══════════════════════════════════════════════════════════════
+  VERSION HISTORY
+══════════════════════════════════════════════════════════════
+
+  v1.1  8 new diagnostic checks (MTU, double NAT, tunnel
+        adapters, port conflicts, UPnP conflicts, admin
+        check, network profile, Kai version); resizable
+        windows; bug fixes for false positives
+
+  v1.0  Initial release — UPnP port opener, router guide,
+        diagnostics with auto-fix
 
 
 ══════════════════════════════════════════════════════════════
