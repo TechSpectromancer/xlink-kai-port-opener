@@ -9,9 +9,11 @@ import socket
 import urllib.request
 import urllib.parse
 import ipaddress
+import datetime
+import platform
 import xml.etree.ElementTree as ET
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog, messagebox
 import threading
 import time
 import webbrowser
@@ -1296,12 +1298,19 @@ class DiagnosticsWindow(tk.Toplevel):
                                   command=self._auto_fix, **s)
         self.btn_fix.pack(side=tk.LEFT, padx=(0, 8))
 
+        self.btn_export = tk.Button(bf, text="💾  Export Log",
+                                     bg="#1a4a1a", fg="#00ff88", state=tk.DISABLED,
+                                     command=self._export_log, **s)
+        self.btn_export.pack(side=tk.LEFT, padx=(0, 8))
+
         tk.Button(bf, text="✕  Close", bg="#333355", fg=FG,
                   command=self.destroy, **s).pack(side=tk.RIGHT)
 
         # State
         self._rows = {}
         self._issues = []
+        self._results = {}   # key -> (status, label, message) — populated as checks run
+        self._check_labels = {}  # key -> human label — set in _run_all
 
     def _flog(self, msg, color="#00ff88"):
         self.flog.configure(state=tk.NORMAL)
@@ -1327,6 +1336,7 @@ class DiagnosticsWindow(tk.Toplevel):
             w.destroy()
         self._rows = {}
         self._issues = []
+        self._results = {}
         self._msg_labels = []
 
     def _add_row(self, key, label):
@@ -1352,6 +1362,7 @@ class DiagnosticsWindow(tk.Toplevel):
         """Update a row: status = True/False/None (warn)."""
         if key not in self._rows:
             return
+        self._results[key] = (status, self._check_labels.get(key, key), message)
         icon_var, msg_var, frame = self._rows[key]
         if status is True:
             icon_var.set("✅")
@@ -1398,6 +1409,7 @@ class DiagnosticsWindow(tk.Toplevel):
             ("fw_ports",         "Firewall UDP 3074/30000"),
             ("fw_kaiengine",     "Firewall kaiEngine.exe"),
         ]
+        self._check_labels = dict(checks)
         for key, label in checks:
             self._add_row(key, label)
 
@@ -1538,6 +1550,416 @@ class DiagnosticsWindow(tk.Toplevel):
             self.after(0, lambda: self.btn_fix.configure(state=tk.NORMAL))
 
         self.after(0, lambda: self.btn_run.configure(state=tk.NORMAL))
+        self.after(0, lambda: self.btn_export.configure(state=tk.NORMAL))
+
+    # ── Remediation steps shown in the export log ─────────────────────────────
+    _REMEDIATION = {
+        "admin": [
+            "HOW TO RUN AS ADMINISTRATOR:",
+            "  1. Close this tool completely.",
+            "  2. Find Run_XlinkPortOpener.bat in the folder.",
+            "  3. Right-click it and choose 'Run as administrator'.",
+            "  4. Click Yes on the UAC prompt.",
+            "  5. Re-run diagnostics.",
+            "",
+            "WHY THIS MATTERS:",
+            "  Without admin rights, Auto-Fix cannot add firewall rules,",
+            "  change network profiles, or adjust MTU settings.",
+        ],
+        "net_profile": [
+            "HOW TO CHANGE NETWORK PROFILE TO PRIVATE:",
+            "  Option A — Auto-Fix (click Auto-Fix Issues button).",
+            "  Option B — Manual:",
+            "    1. Click the Wi-Fi or Ethernet icon in the system tray.",
+            "    2. Click the arrow next to your network name.",
+            "    3. Click Properties.",
+            "    4. Under Network profile type, select Private.",
+            "  Option C — PowerShell (run as Administrator):",
+            "    Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private",
+            "",
+            "WHY THIS MATTERS:",
+            "  Windows Public profile blocks incoming UDP traffic even",
+            "  when firewall rules exist — Xlink Kai will not receive",
+            "  packets from other players.",
+        ],
+        "kai_version": [
+            "HOW TO INSTALL XLINK KAI:",
+            "  1. Visit: https://www.teamxlink.co.uk/",
+            "  2. Download the latest installer for Windows.",
+            "  3. Run the installer as Administrator.",
+            "  4. After install, launch Xlink Kai before using this tool.",
+        ],
+        "xlink_running": [
+            "HOW TO START XLINK KAI:",
+            "  1. Find kaiEngine.exe in your Xlink Kai install folder.",
+            "     Common location: C:\\Program Files (x86)\\XLink Kai\\",
+            "  2. Double-click kaiEngine.exe to start it.",
+            "  3. Open a browser and go to: http://localhost:34522",
+            "     to confirm the UI loads.",
+            "  4. Leave kaiEngine running while using this tool.",
+        ],
+        "webui": [
+            "HOW TO DIAGNOSE XLINK KAI WEB UI NOT RESPONDING:",
+            "  1. Check Task Manager — is kaiEngine.exe in the list?",
+            "     If not, launch it from the install folder.",
+            "  2. Open browser and try: http://localhost:34522",
+            "     If it does not load, kaiEngine may have crashed.",
+            "  3. Try restarting kaiEngine.exe.",
+            "  4. Check Windows Firewall — kaiEngine.exe must have",
+            "     an inbound exception (Auto-Fix can add this).",
+            "  5. Check if another app is using port 34522:",
+            "     Open CMD as Admin and run:",
+            "     netstat -ano | findstr \":34522\"",
+        ],
+        "orbital": [
+            "HOW TO DIAGNOSE ORBITAL SERVER NOT REACHABLE:",
+            "  1. Check your internet connection — open a browser and",
+            "     verify you can load a webpage.",
+            "  2. Disable any VPN — VPNs block Xlink Kai traffic.",
+            "  3. Check Windows Firewall — kaiEngine.exe must be allowed.",
+            "  4. Temporarily disable antivirus and retest.",
+            "  5. Check router firewall — ensure outbound UDP is not blocked.",
+            "  6. Try from a different network (hotspot) to isolate the issue.",
+        ],
+        "vpn": [
+            "HOW TO DISABLE YOUR VPN:",
+            "  1. Find your VPN app in the system tray (bottom-right).",
+            "  2. Right-click it and choose Disconnect or Disable.",
+            "  3. For WireGuard / OpenVPN: open the app and click Disconnect.",
+            "  4. Verify the VPN adapter is gone:",
+            "     Open CMD and run: ipconfig",
+            "     You should not see a TAP/TUN adapter.",
+            "  5. Re-run diagnostics after disconnecting.",
+            "",
+            "WHY THIS MATTERS:",
+            "  VPNs route all traffic through an encrypted tunnel.",
+            "  Xlink Kai's System Link tunneling conflicts with this —",
+            "  other players cannot reach your PC.",
+        ],
+        "teredo": [
+            "HOW TO DISABLE TEREDO / 6TO4 TUNNEL ADAPTERS:",
+            "  1. Open Command Prompt as Administrator.",
+            "  2. Run these commands one at a time:",
+            "     netsh interface teredo set state disabled",
+            "     netsh interface 6to4 set state disabled",
+            "     netsh interface isatap set state disabled",
+            "  3. Restart your PC.",
+            "  4. Re-run diagnostics to confirm they are gone.",
+        ],
+        "ics": [
+            "HOW TO DISABLE INTERNET CONNECTION SHARING (ICS):",
+            "  1. Press Windows Key + R, type: ncpa.cpl, press Enter.",
+            "  2. Right-click your main internet adapter.",
+            "  3. Click Properties -> Sharing tab.",
+            "  4. Uncheck 'Allow other network users to connect...'",
+            "  5. Click OK and restart the PC.",
+        ],
+        "adapters": [
+            "HOW TO IMPROVE YOUR NETWORK CONNECTION:",
+            "  STRONGLY RECOMMENDED: Use a wired Ethernet cable.",
+            "  1. Connect an Ethernet cable from your PC to the router.",
+            "  2. Disable Wi-Fi in Windows:",
+            "     Settings -> Network & Internet -> Wi-Fi -> toggle Off.",
+            "  3. Re-run diagnostics.",
+            "",
+            "If Ethernet is not possible:",
+            "  - Move closer to the router.",
+            "  - Use 5GHz Wi-Fi if available.",
+            "  - Avoid using both Wi-Fi and Ethernet at the same time.",
+        ],
+        "mtu": [
+            "HOW TO FIX HIGH MTU:",
+            "  Option A — Auto-Fix (click Auto-Fix Issues button).",
+            "  Option B — Manual (run CMD as Administrator):",
+            "    1. Find your adapter name:",
+            "       netsh interface ipv4 show subinterfaces",
+            "    2. Set MTU to 1500 (replace NAME with your adapter name):",
+            "       netsh interface ipv4 set subinterface \"NAME\" mtu=1500 store=persistent",
+            "",
+            "WHY THIS MATTERS:",
+            "  MTU above 1500 causes large packets to fragment.",
+            "  Fragmented UDP packets are often dropped by routers,",
+            "  causing dropped connections in Xlink Kai.",
+        ],
+        "xbox": [
+            "HOW TO GET YOUR XBOX DETECTED ON THE NETWORK:",
+            "  1. Make sure your Xbox is powered ON (not in standby).",
+            "  2. Make sure the Xbox is connected to the same router",
+            "     as your PC — either by Ethernet or Wi-Fi.",
+            "  3. On the Xbox: go to Settings -> Network Settings",
+            "     and run a connection test to confirm it is online.",
+            "  4. Check the router's connected devices list to confirm",
+            "     the Xbox appears there.",
+            "  5. If using a network switch, try connecting the Xbox",
+            "     directly to the router instead.",
+            "",
+            "NOTE: Xbox must be on the same LAN segment as your PC.",
+            "  If your router has separate 2.4GHz and 5GHz networks,",
+            "  both devices must be on the same one.",
+        ],
+        "double_nat": [
+            "HOW TO FIX DOUBLE NAT:",
+            "  Double NAT means two devices are each doing NAT (address",
+            "  translation). UPnP only opens ports on your router — the",
+            "  outer modem/gateway still blocks traffic.",
+            "",
+            "  OPTION 1 — Enable Bridge Mode on ISP modem (recommended):",
+            "    1. Log into your ISP modem admin page.",
+            "       Common address: http://192.168.100.1 or http://10.0.0.1",
+            "    2. Find Bridge Mode, IP Passthrough, or DMZ setting.",
+            "    3. Enable it and point it to your router's IP.",
+            "    4. Your router becomes the only NAT device.",
+            "",
+            "  OPTION 2 — Use ISP modem's DMZ:",
+            "    1. Log into your ISP modem.",
+            "    2. Find DMZ settings and enter your router's WAN IP.",
+            "    3. This forwards all ports to your router.",
+            "",
+            "  OPTION 3 — Contact your ISP:",
+            "    Ask them to put the modem in bridge mode for you.",
+        ],
+        "upnp_conflict": [
+            "HOW TO FIX UPNP PORT CONFLICTS:",
+            "  Another device on your network has already claimed UDP",
+            "  3074 or 30000 on the router. Only one device can hold",
+            "  each port mapping at a time.",
+            "",
+            "  1. Log into your router admin page.",
+            "     (Use Router Setup Guide button to find your login details.)",
+            "  2. Find the port forwarding or UPnP mappings section.",
+            "  3. Delete any existing entries for UDP 3074 and UDP 30000.",
+            "  4. Return to this tool and click 'Open Ports 3074 & 30000'.",
+            "",
+            "  ALTERNATIVELY: On the other device (e.g. another Xbox PC),",
+            "  remove its port mappings, then re-open ports here.",
+        ],
+        "port_conflict": [
+            "HOW TO FIX LOCAL PORT CONFLICTS:",
+            "  Another program on this PC is already listening on UDP 3074",
+            "  or UDP 30000. Xlink Kai cannot use them if another app is.",
+            "",
+            "  1. Open Command Prompt as Administrator.",
+            "  2. Run: netstat -ano | findstr \":3074\"",
+            "     and: netstat -ano | findstr \":30000\"",
+            "  3. Note the PID number in the last column.",
+            "  4. Open Task Manager -> Details tab.",
+            "  5. Find the process with that PID and end it.",
+            "  6. If it is a system process, a restart may be needed.",
+        ],
+        "fw_ports": [
+            "HOW TO ADD WINDOWS FIREWALL RULES FOR UDP 3074 & 30000:",
+            "  Option A — Auto-Fix (click Auto-Fix Issues button).",
+            "  Option B — Manual (run CMD as Administrator):",
+            "    netsh advfirewall firewall add rule name=\"Xlink Kai UDP 3074\"",
+            "      dir=in action=allow protocol=UDP localport=3074",
+            "      enable=yes profile=any",
+            "    netsh advfirewall firewall add rule name=\"Xlink Kai UDP 30000\"",
+            "      dir=in action=allow protocol=UDP localport=30000",
+            "      enable=yes profile=any",
+            "",
+            "  TO VERIFY: Run diagnostics again after adding rules.",
+            "",
+            "WHY THIS MATTERS:",
+            "  Windows Firewall blocks inbound UDP by default.",
+            "  Without these rules, other players' game data is silently",
+            "  dropped before it reaches Xlink Kai.",
+        ],
+        "fw_kaiengine": [
+            "HOW TO ADD A FIREWALL EXCEPTION FOR kaiEngine.exe:",
+            "  Option A — Auto-Fix (click Auto-Fix Issues button).",
+            "  Option B — Manual:",
+            "    1. Open Windows Security -> Firewall & network protection.",
+            "    2. Click 'Allow an app through firewall'.",
+            "    3. Click 'Change settings' -> 'Allow another app'.",
+            "    4. Browse to: C:\\Program Files (x86)\\XLink Kai\\kaiEngine.exe",
+            "    5. Check both Private and Public, click OK.",
+            "  Option C — CMD as Administrator:",
+            "    netsh advfirewall firewall add rule name=\"XLink Kai Engine\"",
+            "      dir=in action=allow protocol=any",
+            "      program=\"C:\\Program Files (x86)\\XLink Kai\\kaiEngine.exe\"",
+            "      enable=yes profile=any",
+        ],
+    }
+
+    def _export_log(self):
+        """Save a diagnostic report the user can share for remote troubleshooting."""
+        if not self._results:
+            messagebox.showinfo("Export Log", "Run diagnostics first before exporting.")
+            return
+
+        default_name = f"XlinkKai_DiagReport_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=default_name,
+            title="Save Diagnostic Report"
+        )
+        if not path:
+            return
+
+        try:
+            self._write_report(path)
+            messagebox.showinfo("Export Log",
+                f"Report saved to:\n{path}\n\nShare this file for troubleshooting assistance.")
+        except OSError as e:
+            messagebox.showerror("Export Log", f"Could not save file:\n{e}")
+
+    def _write_report(self, path: str):
+        app = self._app
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        errors   = [(k, lbl, msg) for k, (s, lbl, msg) in self._results.items() if s is False]
+        warnings = [(k, lbl, msg) for k, (s, lbl, msg) in self._results.items() if s is None]
+        passed   = [(k, lbl, msg) for k, (s, lbl, msg) in self._results.items() if s is True]
+
+        lines = []
+        def w(text=""): lines.append(text)
+
+        w("╔══════════════════════════════════════════════════════════════════════╗")
+        w("║          XLINK KAI PORT OPENER — DIAGNOSTIC REPORT                 ║")
+        w("║          Rainbow Six 3 / Black Arrow — Original Xbox               ║")
+        w("╚══════════════════════════════════════════════════════════════════════╝")
+        w()
+        w(f"  Generated : {now}")
+        w(f"  Tool      : Xlink Kai Port Opener v2.0  (by Juv3nile)")
+        w(f"  OS        : {platform.version()}")
+        w(f"  Python    : {platform.python_version()}")
+        w(f"  Machine   : {platform.machine()}")
+        w()
+
+        # Network info from App
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  NETWORK SNAPSHOT")
+        w("══════════════════════════════════════════════════════════════════════")
+        w(f"  LAN IP      : {app.vlan.get()}")
+        w(f"  Router IP   : {app.vgw.get()}")
+        w(f"  External IP : {app.vext.get()}")
+        w(f"  UPnP Service: {getattr(app, 'stype', None) or 'Not detected'}")
+        w()
+
+        # Summary
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  RESULTS SUMMARY")
+        w("══════════════════════════════════════════════════════════════════════")
+        w(f"  ❌ Errors   : {len(errors)}")
+        w(f"  ⚠️  Warnings : {len(warnings)}")
+        w(f"  ✅ Passed   : {len(passed)}")
+        w()
+
+        # AI prompt header
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  HOW TO USE THIS REPORT WITH AI")
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  Paste the entire contents of this file into an AI assistant")
+        w("  (ChatGPT, Claude, etc.) and use this prompt:")
+        w()
+        w('  "I am trying to get Xlink Kai working for Rainbow Six 3 Black')
+        w('   Arrow on original Xbox. Below is my diagnostic report from')
+        w('   the Xlink Kai Port Opener tool. Please review the errors and')
+        w('   warnings and give me step-by-step instructions to fix them.')
+        w('   Start with the most critical issue first."')
+        w()
+
+        # Errors
+        if errors:
+            w("══════════════════════════════════════════════════════════════════════")
+            w("  ❌ ERRORS — MUST FIX (start here)")
+            w("══════════════════════════════════════════════════════════════════════")
+            for i, (key, lbl, msg) in enumerate(errors, 1):
+                w()
+                w(f"  [{i}] {lbl.upper()}")
+                w(f"      Diagnostic result: {msg}")
+                w()
+                steps = self._REMEDIATION.get(key)
+                if steps:
+                    for step in steps:
+                        w(f"      {step}")
+                else:
+                    w("      Refer to the Xlink Kai Port Opener documentation.")
+                w()
+
+        # Warnings
+        if warnings:
+            w("══════════════════════════════════════════════════════════════════════")
+            w("  ⚠️  WARNINGS — INVESTIGATE IF STILL HAVING ISSUES")
+            w("══════════════════════════════════════════════════════════════════════")
+            for i, (key, lbl, msg) in enumerate(warnings, 1):
+                w()
+                w(f"  [{i}] {lbl.upper()}")
+                w(f"      Diagnostic result: {msg}")
+                w()
+                steps = self._REMEDIATION.get(key)
+                if steps:
+                    for step in steps:
+                        w(f"      {step}")
+                else:
+                    w("      Refer to the Xlink Kai Port Opener documentation.")
+                w()
+
+        # Passed
+        if passed:
+            w("══════════════════════════════════════════════════════════════════════")
+            w("  ✅ PASSED CHECKS")
+            w("══════════════════════════════════════════════════════════════════════")
+            for key, lbl, msg in passed:
+                w(f"  ✅ {lbl:<28} {msg}")
+            w()
+
+        # Fix log
+        fix_text = self.flog.get("1.0", tk.END).strip()
+        if fix_text:
+            w("══════════════════════════════════════════════════════════════════════")
+            w("  AUTO-FIX LOG")
+            w("══════════════════════════════════════════════════════════════════════")
+            for line in fix_text.splitlines():
+                w(f"  {line}")
+            w()
+
+        # Where to start on screen share
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  SCREEN SHARE CHECKLIST — WHERE TO BEGIN")
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  When sharing your screen for remote support, verify these in order:")
+        w()
+        w("  STEP 1 — Confirm Xlink Kai is running")
+        w("    [ ] kaiEngine.exe visible in Task Manager (Details tab)")
+        w("    [ ] http://localhost:34522 loads in browser")
+        w("    [ ] Xlink Kai shows your username and orbital connection")
+        w()
+        w("  STEP 2 — Confirm network profile")
+        w("    [ ] Settings -> Network & Internet -> your connection")
+        w("         shows 'Private network' (not Public)")
+        w()
+        w("  STEP 3 — Confirm firewall rules exist")
+        w("    [ ] Open CMD as Admin and run:")
+        w("         netsh advfirewall firewall show rule name=\"Xlink Kai UDP 3074\"")
+        w("         netsh advfirewall firewall show rule name=\"Xlink Kai UDP 30000\"")
+        w("    [ ] Both should show Enabled: Yes")
+        w()
+        w("  STEP 4 — Confirm ports are open on router")
+        w("    [ ] This tool shows 'OPEN' in the Ports Status field")
+        w("    [ ] In Xlink Kai web UI, Metrics tab, NAT Type = Open or Moderate")
+        w()
+        w("  STEP 5 — Confirm Xbox is online and visible")
+        w("    [ ] Xbox is powered on and connected to same router")
+        w("    [ ] Xbox Settings -> Network -> Connection Test passes")
+        w("    [ ] This tool detected Xbox in ARP scan (check above)")
+        w()
+        w("  STEP 6 — Confirm no VPN / tunnel interference")
+        w("    [ ] VPN app is disconnected")
+        w("    [ ] ipconfig shows no TAP, TUN, or WireGuard adapters")
+        w()
+        w("  STEP 7 — Test in Xlink Kai")
+        w("    [ ] Join or host an arena in Xlink Kai")
+        w("    [ ] Other players' latency bars should be green/yellow")
+        w("    [ ] Launch game and test System Link")
+        w()
+        w("══════════════════════════════════════════════════════════════════════")
+        w("  END OF REPORT")
+        w("══════════════════════════════════════════════════════════════════════")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
 
     def _auto_fix(self):
         self.btn_fix.configure(state=tk.DISABLED)
