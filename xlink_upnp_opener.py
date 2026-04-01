@@ -7,6 +7,8 @@ No external dependencies - pure Python 3
 
 import socket
 import urllib.request
+import urllib.parse
+import ipaddress
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk, scrolledtext
@@ -18,9 +20,11 @@ import subprocess
 import os
 import sys
 import ctypes
+import logging
+import pathlib
 
 # ── Subprocess flag ────────────────────────────────────────────────────────────
-NO_WIN = subprocess.CREATE_NO_WINDOW
+NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ── UI colour palette ──────────────────────────────────────────────────────────
 BG   = "#1a1a2e"
@@ -49,6 +53,16 @@ SSDP_ST_LIST = [
     "ssdp:all",
 ]
 
+# ── Process / executable constants ─────────────────────────────────────────────
+KAI_ENGINE_EXE   = "kaiEngine.exe"
+XLINK_KAI_EXE    = "XLinkKai.exe"
+KAI_WEBUI_PORT   = 34522
+KAI_INSTALL_PATHS = [
+    r"C:\Program Files (x86)\XLink Kai\kaiEngine.exe",
+    r"C:\Program Files\XLink Kai\kaiEngine.exe",
+    r"C:\XLink Kai\kaiEngine.exe",
+]
+
 def _ssdp_request(st):
     return (
         "M-SEARCH * HTTP/1.1\r\n"
@@ -57,6 +71,23 @@ def _ssdp_request(st):
         "MX: 3\r\n"
         f"ST: {st}\r\n\r\n"
     ).encode()
+
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+def _setup_logging(debug: bool = False) -> logging.Logger:
+    log_dir = pathlib.Path(os.environ.get("APPDATA", ".")) / "XlinkKaiPortOpener"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "debug.log"
+    level = logging.DEBUG if debug else logging.INFO
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log = logging.getLogger("xlink_kai")
+    log.setLevel(level)
+    if not log.handlers:
+        log.addHandler(handler)
+    return log
+
+logger = _setup_logging()
 
 # ── Watermark Canvas Logo ─────────────────────────────────────────────────────
 def draw_watermark(parent, bg="#1a1a2e"):
@@ -391,9 +422,27 @@ def _get_default_gateway():
                 m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
                 if m and not m.group(1).startswith("0."):
                     return m.group(1)
-    except Exception:
+    except (subprocess.CalledProcessError, OSError):
         pass
     return None
+
+
+def _is_lan_url(location: str) -> bool:
+    """Return True only if location is http:// pointing to a private/LAN address.
+
+    Prevents SSRF by rejecting locations that point outside the local network.
+    """
+    try:
+        parsed = urllib.parse.urlparse(location)
+        if parsed.scheme != "http":
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback
+    except (ValueError, Exception):
+        return False
 
 
 def discover_gateway(timeout=8):
@@ -406,8 +455,8 @@ def discover_gateway(timeout=8):
     - Each probe is sent twice to handle routers that drop the first packet
     - Responses are collected for the full timeout window
     """
-    local_ip = get_local_ip()
     gateway_ip = _get_default_gateway()
+    local_ip = get_local_ip(gateway_ip)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -415,10 +464,10 @@ def discover_gateway(timeout=8):
     # Bind to the local IP so multicast/responses use the correct interface
     try:
         sock.bind((local_ip, 0))
-    except Exception:
+    except OSError:
         try:
             sock.bind(('', 0))
-        except Exception:
+        except OSError:
             pass
 
     # Build target list: always multicast, plus unicast to gateway if known
@@ -433,7 +482,7 @@ def discover_gateway(timeout=8):
                 for _ in range(2):
                     try:
                         sock.sendto(req, target)
-                    except Exception:
+                    except OSError:
                         pass
                     time.sleep(0.05)
 
@@ -451,8 +500,9 @@ def discover_gateway(timeout=8):
                 for line in response.splitlines():
                     if line.strip().lower().startswith("location:"):
                         loc = line.split(":", 1)[1].strip()
-                        if loc not in seen:
+                        if loc not in seen and _is_lan_url(loc):
                             seen.add(loc)
+                            logger.info("Discovered gateway at %s (from %s)", loc, addr[0])
                             return loc, addr[0]
             except socket.timeout:
                 break
@@ -464,18 +514,33 @@ def discover_gateway(timeout=8):
 def get_service_url(location):
     with urllib.request.urlopen(location, timeout=5) as r:
         xml_str = r.read().decode("utf-8", errors="ignore")
-    xml_str = re.sub(r'\s+xmlns[^"]*"[^"]*"', '', xml_str)
-    xml_str = re.sub(r'<(\w+):([^>]*)>', r'<\2>', xml_str)
-    xml_str = re.sub(r'</(\w+):([^>]*)>', r'</\2>', xml_str)
     root = ET.fromstring(xml_str)
-    base_url = "/".join(location.split("/")[:3])
-    for service in root.iter("service"):
-        st = service.findtext("serviceType") or ""
-        for target in ["WANIPConnection:1", "WANIPConnection:2", "WANPPPConnection:1"]:
+
+    # Determine base URL: prefer URLBase from device description if present
+    parsed_loc = urllib.parse.urlparse(location)
+    base_url = f"{parsed_loc.scheme}://{parsed_loc.netloc}"
+    for elem in root.iter():
+        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if local == "URLBase" and elem.text and elem.text.strip():
+            base_url = elem.text.strip().rstrip("/")
+            break
+
+    # Walk all elements; strip namespace prefix to match serviceType/controlURL
+    for elem in root.iter():
+        if (elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag) != "service":
+            continue
+        st = ctrl = ""
+        for child in elem:
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if tag == "serviceType":
+                st = child.text or ""
+            elif tag == "controlURL":
+                ctrl = child.text or ""
+        for target in ("WANIPConnection:1", "WANIPConnection:2", "WANPPPConnection:1"):
             if target in st:
-                ctrl = service.findtext("controlURL") or ""
                 if not ctrl.startswith("http"):
                     ctrl = base_url + ("" if ctrl.startswith("/") else "/") + ctrl
+                logger.info("Using UPnP service %s at %s", st, ctrl)
                 return ctrl, st
     raise RuntimeError("No WANIPConnection service found")
 
@@ -497,16 +562,22 @@ def soap_action(url, stype, action, args=""):
         return e.read().decode("utf-8", errors="ignore"), e.code
     except urllib.error.URLError as e:
         return f"URLError: {e.reason}", 0
-    except Exception as e:
+    except OSError as e:
         return f"Error: {e}", 0
 
 
-def get_local_ip():
+def get_local_ip(gateway: str = None) -> str:
+    """Return the local IP used to reach `gateway` (or 8.8.8.8 as fallback).
+
+    Passing the discovered gateway ensures we bind the same interface that
+    UPnP responses came in on, which matters on multi-NIC hosts.
+    """
+    target = gateway if gateway else "8.8.8.8"
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
+        s.connect((target, 80))
         return s.getsockname()[0]
-    except Exception:
+    except OSError:
         return "127.0.0.1"
     finally:
         s.close()
@@ -631,31 +702,28 @@ class RouterGuideWindow(tk.Toplevel):
 # ── Diagnostics checks ────────────────────────────────────────────────────────
 def check_xlink_running():
     """Check if kaiEngine.exe or XLink Kai process is running."""
-    try:
-        out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq kaiEngine.exe", "/NH"],
-            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
-        if "kaiEngine.exe" in out:
-            return True, "kaiEngine.exe is running"
-        # Also check for XLinkKai.exe
-        out2 = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq XLinkKai.exe", "/NH"],
-            stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
-        if "XLinkKai.exe" in out2:
-            return True, "XLinkKai.exe is running"
-        return False, "Xlink Kai is NOT running (kaiEngine.exe not found)"
-    except Exception as e:
-        return None, f"Could not check processes: {e}"
+    for exe in (KAI_ENGINE_EXE, XLINK_KAI_EXE):
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"IMAGENAME eq {exe}", "/NH", "/FO", "CSV"],
+                stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
+            for line in out.splitlines():
+                parts = line.strip().strip('"').split('","')
+                if parts and parts[0].lower() == exe.lower():
+                    return True, f"{exe} is running"
+        except (subprocess.CalledProcessError, OSError) as e:
+            return None, f"Could not check processes: {e}"
+    return False, f"Xlink Kai is NOT running ({KAI_ENGINE_EXE} not found)"
 
 
 def check_xlink_webui():
     """Try to reach Xlink Kai web UI at localhost:34522."""
     try:
-        urllib.request.urlopen("http://127.0.0.1:34522/", timeout=2)
-        return True, "Xlink Kai web UI reachable at http://localhost:34522"
+        urllib.request.urlopen(f"http://127.0.0.1:{KAI_WEBUI_PORT}/", timeout=2)
+        return True, f"Xlink Kai web UI reachable at http://localhost:{KAI_WEBUI_PORT}"
     except urllib.error.URLError:
-        return False, "Xlink Kai web UI not reachable (port 34522 not responding)"
-    except Exception as e:
+        return False, f"Xlink Kai web UI not reachable (port {KAI_WEBUI_PORT} not responding)"
+    except OSError as e:
         return False, f"Web UI check failed: {e}"
 
 
@@ -671,7 +739,7 @@ def get_all_firewall_rules():
             ["netsh", "advfirewall", "firewall", "show", "rule", "name=all",
              "dir=in", "verbose"],
             stderr=subprocess.DEVNULL, creationflags=NO_WIN).decode(errors="ignore")
-    except Exception:
+    except (subprocess.CalledProcessError, OSError):
         return ""
 
 
@@ -743,7 +811,7 @@ def check_network_adapters():
             is_wifi = any(w in name.lower() for w in ["wi-fi","wifi","wireless","wlan","802.11"])
             adapters.append((name, is_wifi))
         return adapters
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError):
         return []
 
 
@@ -768,7 +836,7 @@ def check_xbox_on_network():
         if found:
             return True, f"Xbox detected on network at: {', '.join(found)}"
         return False, "No Xbox detected in ARP table (is Xbox on and connected?)"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"ARP check failed: {e}"
 
 
@@ -785,7 +853,7 @@ def check_orbital_ping():
             avg = m.group(1) + "ms" if m else "OK"
             return True, f"Xlink Kai orbital server reachable (avg {avg})"
         return False, "Xlink Kai orbital server not reachable (ping failed)"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"Ping check failed: {e}"
 
 
@@ -799,7 +867,7 @@ def check_connection_sharing():
         if "192.168.137" in out:
             return False, "Internet Connection Sharing (ICS) may be active - can interfere with Xlink Kai"
         return True, "No Internet Connection Sharing conflicts detected"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"ICS check failed: {e}"
 
 
@@ -810,7 +878,7 @@ def check_admin():
         if is_admin:
             return True, "Running as Administrator — Auto-Fix has full permissions"
         return False, "Not running as Administrator — Auto-Fix (firewall rules) may fail"
-    except Exception as e:
+    except OSError as e:
         return None, f"Could not check admin status: {e}"
 
 
@@ -834,13 +902,14 @@ def check_double_nat(ctrl, stype):
         is_private = (
             first == 10 or
             (first == 172 and 16 <= second <= 31) or
-            (first == 192 and second == 168)
+            (first == 192 and second == 168) or
+            (first == 100 and 64 <= second <= 127)   # CGNAT RFC 6598
         )
         if is_private:
             return False, (f"Double NAT detected — router WAN IP {ext_ip} is a private address. "
                            f"Enable bridge/passthrough mode on your ISP modem to fix this.")
         return True, f"No double NAT — external IP {ext_ip} is a public address"
-    except Exception as e:
+    except (OSError, ValueError) as e:
         return None, f"Double NAT check failed: {e}"
 
 
@@ -863,7 +932,7 @@ def check_network_profile():
             return False, ("Network set to Public profile — change to Private so Windows "
                            "allows Xlink Kai traffic through the firewall")
         return True, f"Network profile: {', '.join(profiles)} — OK"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"Network profile check failed: {e}"
 
 
@@ -880,7 +949,7 @@ def fix_network_profile():
         return True, "Network profile changed to Private"
     except subprocess.CalledProcessError:
         return False, "Failed to change profile — re-run as Administrator"
-    except Exception as e:
+    except OSError as e:
         return False, f"Could not change network profile: {e}"
 
 
@@ -904,7 +973,7 @@ def check_vpn_active():
         if found:
             return False, f"VPN adapter detected: {', '.join(found[:2])} - disable VPN before using Xlink Kai"
         return True, "No active VPN adapters detected"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"VPN check failed: {e}"
 
 
@@ -913,7 +982,7 @@ def check_port_conflict():
     try:
         # Get PIDs belonging to Xlink Kai so we can exclude them
         kai_pids = set()
-        for exe in ["kaiEngine.exe", "XLinkKai.exe"]:
+        for exe in (KAI_ENGINE_EXE, XLINK_KAI_EXE):
             try:
                 tl = subprocess.check_output(
                     ["tasklist", "/FI", f"IMAGENAME eq {exe}", "/NH", "/FO", "CSV"],
@@ -926,7 +995,7 @@ def check_port_conflict():
                             kai_pids.add(int(parts[1]))
                         except ValueError:
                             pass
-            except Exception:
+            except (subprocess.CalledProcessError, OSError):
                 pass
 
         # netstat -ano shows UDP lines with PIDs: "UDP  0.0.0.0:3074  *:*  12345"
@@ -948,7 +1017,7 @@ def check_port_conflict():
             return None, (f"Port(s) in use by another app: {', '.join(conflicts)} — "
                           f"see Auto-Fix log for how to identify and close it")
         return True, "UDP 3074 & 30000 are free — no port conflicts detected"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"Port conflict check failed: {e}"
 
 
@@ -974,7 +1043,7 @@ def check_upnp_conflicts(ctrl, stype):
             return False, (f"Router ports mapped to another device: {'; '.join(conflicts)} — "
                            f"remove those mappings or open ports from that device instead")
         return True, "No conflicting UPnP mappings on router"
-    except Exception as e:
+    except OSError as e:
         return None, f"UPnP conflict check failed: {e}"
 
 
@@ -1005,7 +1074,7 @@ def check_mtu():
             return False, (f"High MTU on: {', '.join(high_mtu)} — "
                            f"values above 1500 cause fragmentation; Auto-Fix can correct this")
         return True, "MTU is 1500 or below on all adapters — OK"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"MTU check failed: {e}"
 
 
@@ -1031,14 +1100,14 @@ def fix_mtu():
                             creationflags=NO_WIN
                         )
                         fixed.append(name)
-                    except Exception:
+                    except (subprocess.CalledProcessError, OSError):
                         failed.append(name)
         if fixed:
             return True, f"MTU set to 1500 on: {', '.join(fixed)}"
         if failed:
             return False, f"Could not set MTU on: {', '.join(failed)} — re-run as Administrator"
         return None, "No adapters needed MTU adjustment"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return False, f"MTU fix failed: {e}"
 
 
@@ -1067,7 +1136,7 @@ def check_teredo_6to4():
             return None, (f"Tunnel adapter(s) detected: {'; '.join(issues)} — "
                           f"can cause routing conflicts with Xlink Kai")
         return True, "No Teredo/6to4/ISATAP tunnel adapters active"
-    except Exception as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         return None, f"Tunnel adapter check failed: {e}"
 
 
@@ -1091,11 +1160,9 @@ def check_kai_version():
         except OSError:
             continue
     # Fallback: look for the executable
-    for exe in [r"C:\Program Files (x86)\XLink Kai\kaiEngine.exe",
-                r"C:\Program Files\XLink Kai\kaiEngine.exe",
-                r"C:\XLink Kai\kaiEngine.exe"]:
+    for exe in KAI_INSTALL_PATHS:
         if os.path.exists(exe):
-            return None, f"Xlink Kai found (version unknown) — reinstall to register version"
+            return None, "Xlink Kai found (version unknown) — reinstall to register version"
     return False, "Xlink Kai does not appear to be installed — download from teamxlink.co.uk"
 
 
@@ -1123,21 +1190,15 @@ def add_firewall_rules():
             results.append((True, port, f"Firewall rule added for UDP {port}"))
         except subprocess.CalledProcessError:
             results.append((False, port, f"Failed to add rule for UDP {port} (run as Administrator)"))
-        except Exception as e:
+        except OSError as e:
             results.append((False, port, f"Error adding rule for UDP {port}: {e}"))
     return results
 
 
 def add_kaiengine_exception():
     """Add Windows Firewall exception for kaiEngine.exe."""
-    # Find kaiEngine.exe
-    common_paths = [
-        r"C:\Program Files (x86)\XLink Kai\kaiEngine.exe",
-        r"C:\Program Files\XLink Kai\kaiEngine.exe",
-        r"C:\XLink Kai\kaiEngine.exe",
-    ]
     kai_path = None
-    for p in common_paths:
+    for p in KAI_INSTALL_PATHS:
         if os.path.exists(p):
             kai_path = p
             break
@@ -1151,8 +1212,8 @@ def add_kaiengine_exception():
             f"program={kai_path}", "enable=yes", "profile=any"
         ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
            creationflags=NO_WIN)
-        return True, f"Firewall exception added for kaiEngine.exe"
-    except Exception as e:
+        return True, "Firewall exception added for kaiEngine.exe"
+    except (subprocess.CalledProcessError, OSError) as e:
         return False, f"Failed to add exception: {e}"
 
 
@@ -1659,14 +1720,19 @@ class App(tk.Tk):
         self.after(300, self._run_detect)
 
     def _log(self, msg, color=None):
-        self.log.configure(state=tk.NORMAL)
-        self._log_tag += 1
-        tag = f"t{self._log_tag}"
-        self.log.insert(tk.END, msg + "\n", tag)
-        if color:
-            self.log.tag_config(tag, foreground=color)
-        self.log.see(tk.END)
-        self.log.configure(state=tk.DISABLED)
+        def _do():
+            self.log.configure(state=tk.NORMAL)
+            self._log_tag += 1
+            tag = f"t{self._log_tag}"
+            self.log.insert(tk.END, msg + "\n", tag)
+            if color:
+                self.log.tag_config(tag, foreground=color)
+            self.log.see(tk.END)
+            self.log.configure(state=tk.DISABLED)
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            self.after(0, _do)
 
     def _ok(self, m):  self._log(f"OK  {m}", "#00ff88")
     def _err(self, m): self._log(f"ERR {m}", "#ff4466")
@@ -1680,32 +1746,33 @@ class App(tk.Tk):
     def _detect(self):
         self._inf("Scanning for router via UPnP (trying multiple service types)...")
         self._inf("This may take up to 8 seconds on first attempt...")
-        self.vstatus.set("Scanning...")
-        lip = get_local_ip()
-        self.vlan.set(lip)
+        self.after(0, lambda: self.vstatus.set("Scanning..."))
+        gateway_ip = _get_default_gateway()
+        lip = get_local_ip(gateway_ip)
+        self.after(0, lambda: self.vlan.set(lip))
         loc, gwip = discover_gateway(timeout=8)
         if not loc:
             self._err("No UPnP gateway found.")
             self._inf("Click 'Router Setup Guide' for help enabling UPnP.")
-            self.vstatus.set("Router not found")
+            self.after(0, lambda: self.vstatus.set("Router not found"))
             return
         self._ok(f"Router found at {gwip}")
-        self.vgw.set(gwip)
+        self.after(0, lambda: self.vgw.set(gwip))
         self.gwip = gwip
         self.lip  = lip
         try:
             ctrl, stype = get_service_url(loc)
-        except Exception as e:
+        except (urllib.error.URLError, OSError, ET.ParseError, RuntimeError) as e:
             self._err(f"Could not parse router: {e}")
-            self.vstatus.set("Parse error")
+            self.after(0, lambda: self.vstatus.set("Parse error"))
             return
         self.ctrl  = ctrl
         self.stype = stype
         ext = get_ext_ip(ctrl, stype)
-        self.vext.set(ext)
+        self.after(0, lambda: self.vext.set(ext))
         self._ok(f"External IP: {ext}")
-        self.vstatus.set("Ready")
-        self.bopen.configure(state=tk.NORMAL)
+        self.after(0, lambda: self.vstatus.set("Ready"))
+        self.after(0, lambda: self.bopen.configure(state=tk.NORMAL))
 
     def _run_open(self):
         self.bopen.configure(state=tk.DISABLED)
@@ -1728,18 +1795,18 @@ class App(tk.Tk):
                     self._err(f"No response from router for {proto} {port}: {resp}")
                 else:
                     self._err(f"Failed {proto} {port} (HTTP {status}): {str(resp)[:80]}")
-        except Exception as e:
+        except OSError as e:
             self._err(f"Unexpected error: {e}")
         finally:
             if ok == len(PORTS):
-                self.vstatus.set("OPEN")
+                self.after(0, lambda: self.vstatus.set("OPEN"))
                 self._ok("Both ports open. You can close this window.")
-                self.bclose.configure(state=tk.NORMAL)
+                self.after(0, lambda: self.bclose.configure(state=tk.NORMAL))
             else:
-                self.vstatus.set("Failed - see log")
+                self.after(0, lambda: self.vstatus.set("Failed - see log"))
                 self._err("Some ports failed. Check log above for details.")
                 self._inf("Tips: Run as Administrator. Check UPnP is enabled on router.")
-                self.bopen.configure(state=tk.NORMAL)
+                self.after(0, lambda: self.bopen.configure(state=tk.NORMAL))
 
     def _run_close(self):
         self.bclose.configure(state=tk.DISABLED)
@@ -1752,8 +1819,8 @@ class App(tk.Tk):
                 self._ok(f"UDP {port} removed.")
             else:
                 self._err(f"UDP {port} remove failed (HTTP {status})")
-        self.vstatus.set("Closed")
-        self.bopen.configure(state=tk.NORMAL)
+        self.after(0, lambda: self.vstatus.set("Closed"))
+        self.after(0, lambda: self.bopen.configure(state=tk.NORMAL))
 
 
 if __name__ == "__main__":

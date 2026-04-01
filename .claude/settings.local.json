@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(cd:*)",
+      "Bash(winget install:*)",
+      "Bash(where gh:*)",
+      "Read(//c/Program Files/GitHub CLI/**)",
+      "Read(//c/Users/Mysti/xlink-kai-port-opener/$LOCALAPPDATA/Programs/GitHub CLI/**)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Users/Mysti/**)",
+      "Bash(curl --version)"
+    ]
+  }
+}
