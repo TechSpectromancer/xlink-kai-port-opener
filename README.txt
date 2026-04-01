@@ -1,5 +1,5 @@
 ╔══════════════════════════════════════════════════════════════╗
-║         XLINK KAI PORT OPENER v1.1 - README                 ║
+║         XLINK KAI PORT OPENER v2.0 - README                 ║
 ║         Rainbow Six 3 / Black Arrow - Original Xbox         ║
 ║                                        Created by Juv3nile  ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -189,6 +189,14 @@ Ports open but still lagging in Xlink Kai:
 ══════════════════════════════════════════════════════════════
   VERSION HISTORY
 ══════════════════════════════════════════════════════════════
+
+  v2.0  Major reliability and security overhaul — thread-safe
+        UI (eliminates intermittent crashes), SSRF protection
+        on SSDP location URLs, namespace-aware XML parsing,
+        CGNAT double-NAT detection, correct NIC selection on
+        multi-adapter systems, named constants throughout,
+        consistent CSV process detection, specific exception
+        handling, and structured debug log to %APPDATA%
 
   v1.1  8 new diagnostic checks (MTU, double NAT, tunnel
         adapters, port conflicts, UPnP conflicts, admin
