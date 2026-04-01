@@ -178,6 +178,8 @@ No router login required. No manual configuration. The rules persist until you r
 
 | Version | Notes |
 |---------|-------|
+| v2.1 | Export Log feature — saves a full diagnostic report (.txt) with step-by-step fix instructions for every failing check, an AI prompt template, and a screen share checklist for remote support |
+| v2.0 | Major reliability & security overhaul — thread-safe UI, SSRF protection on SSDP responses, namespace-aware XML parsing, CGNAT double-NAT detection, correct NIC selection on multi-adapter systems, named constants, structured debug logging to %APPDATA% |
 | v1.1 | 8 new diagnostic checks (MTU, double NAT, tunnel adapters, port conflicts, UPnP conflicts, admin check, network profile, Kai version); resizable windows; bug fixes |
 | v1.0 | Initial release — UPnP port opener, router guide, diagnostics with auto-fix |
 

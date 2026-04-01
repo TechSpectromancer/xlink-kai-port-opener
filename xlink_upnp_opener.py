@@ -1,5 +1,5 @@
 """
-Xlink Kai Port Opener v2.0 - Automatic UPnP port forwarder
+Xlink Kai Port Opener v2.1 - Automatic UPnP port forwarder
 Opens UDP 3074 & 30000 on your router for better Xlink Kai connectivity
 Includes Router Setup Guide for first-time users
 No external dependencies - pure Python 3
@@ -1821,7 +1821,7 @@ class DiagnosticsWindow(tk.Toplevel):
         w("╚══════════════════════════════════════════════════════════════════════╝")
         w()
         w(f"  Generated : {now}")
-        w(f"  Tool      : Xlink Kai Port Opener v2.0  (by Juv3nile)")
+        w(f"  Tool      : Xlink Kai Port Opener v2.1  (by Juv3nile)")
         w(f"  OS        : {platform.version()}")
         w(f"  Python    : {platform.python_version()}")
         w(f"  Machine   : {platform.machine()}")
@@ -2064,7 +2064,7 @@ class DiagnosticsWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Xlink Kai Port Opener  v2.0")
+        self.title("Xlink Kai Port Opener  v2.1")
         self.resizable(False, False)
         self.configure(bg=BG)
         self.ctrl = self.stype = self.lip = self.gwip = None

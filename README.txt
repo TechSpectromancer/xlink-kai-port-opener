@@ -1,5 +1,5 @@
 ╔══════════════════════════════════════════════════════════════╗
-║         XLINK KAI PORT OPENER v2.0 - README                 ║
+║         XLINK KAI PORT OPENER v2.1 - README                 ║
 ║         Rainbow Six 3 / Black Arrow - Original Xbox         ║
 ║                                        Created by Juv3nile  ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -189,6 +189,11 @@ Ports open but still lagging in Xlink Kai:
 ══════════════════════════════════════════════════════════════
   VERSION HISTORY
 ══════════════════════════════════════════════════════════════
+
+  v2.1  Export Log button in Diagnostics — saves a full .txt
+        report with step-by-step fix instructions for every
+        failing check, an AI prompt template, and a screen
+        share checklist for remote support sessions
 
   v2.0  Major reliability and security overhaul — thread-safe
         UI (eliminates intermittent crashes), SSRF protection
